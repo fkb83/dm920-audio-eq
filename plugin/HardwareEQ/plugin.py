@@ -9,6 +9,7 @@ from Components.ActionMap import ActionMap
 from Components.ConfigList import ConfigListScreen
 from Components.config import config, configfile, ConfigSubsection, ConfigYesNo, ConfigSelection, getConfigListEntry
 from Components.Sources.StaticText import StaticText
+from enigma import eTimer
 
 import eqmath
 
@@ -23,6 +24,9 @@ config.plugins.hardwareeq = ConfigSubsection()
 config.plugins.hardwareeq.enabled = ConfigYesNo(default=True)
 config.plugins.hardwareeq.preset = ConfigSelection(default="flat", choices=[(k, n) for k, n, g in eqmath.PRESETS])
 config.plugins.hardwareeq.level = ConfigSelection(default="0", choices=LEVEL_CHOICES)
+config.plugins.hardwareeq.protect = ConfigYesNo(default=False)
+config.plugins.hardwareeq.agc = ConfigSelection(default="0", choices=[
+	("0", "aus"), ("1", "leicht (bis -6 dB)"), ("2", "mittel (bis -10 dB)"), ("3", "stark (bis -15 dB)")])
 BANDS_CFG = []
 for _i in range(len(eqmath.BANDS)):
 	setattr(config.plugins.hardwareeq, "band%d" % _i, ConfigSelection(default="0", choices=GAIN_CHOICES))
@@ -71,44 +75,63 @@ def read_status():
 		return ""
 
 
+def read_agc():
+	vals = {}
+	try:
+		for line in open(os.path.join(PROC, "agc")):
+			parts = line.split()
+			if len(parts) == 2:
+				vals[parts[0]] = int(parts[1])
+	except Exception:
+		pass
+	return vals
+
+
 def current_gains():
 	return [int(b.value) for b in BANDS_CFG]
 
 
 def apply_settings():
-	"""Push the configured curve into the hardware. Returns preamp in dB or None."""
+	"""Push EQ curve and level control into the hardware.
+	Returns (preamp_db, max_boost_db) or None if the EQ is off or the module is missing."""
 	cfg = config.plugins.hardwareeq
-	if not cfg.enabled.value:
+	agc = cfg.agc.value
+	if not cfg.enabled.value and agc == "0":
 		if module_loaded():
 			write_proc("biquads", eqmath.flat_line())
+			write_proc("agc", "0")
 		return None
 	if not load_module():
 		return None
-	biquads, preamp = eqmath.design(current_gains(), int(cfg.level.value))
+	write_proc("agc", agc)
+	if not cfg.enabled.value:
+		write_proc("biquads", eqmath.flat_line())
+		return None
+	biquads, preamp = eqmath.design(current_gains(), int(cfg.level.value), cfg.protect.value)
 	if write_proc("biquads", eqmath.to_line(biquads)):
-		return preamp
+		return preamp, eqmath.max_gain_db(biquads)
 	return None
 
 
 class HardwareEQSetup(ConfigListScreen, Screen):
 	skin = """
-	<screen name="HardwareEQSetup" position="center,center" size="1100,860" title="Hardware-Equalizer">
+	<screen name="HardwareEQSetup" position="center,center" size="1100,900" title="Hardware-Equalizer">
 		<widget name="config" position="30,20" size="1040,630" itemHeight="45" scrollbarMode="showOnDemand" />
 		<eLabel position="30,665" size="1040,2" backgroundColor="#00777777" />
-		<widget source="info" render="Label" position="30,680" size="1040,90" font="Regular;28" foregroundColor="#00cccccc" />
-		<eLabel position="30,800" size="15,40" backgroundColor="#00e01e1e" />
-		<widget source="key_red" render="Label" position="55,795" size="230,50" font="Regular;28" valign="center" />
-		<eLabel position="295,800" size="15,40" backgroundColor="#0016a016" />
-		<widget source="key_green" render="Label" position="320,795" size="230,50" font="Regular;28" valign="center" />
-		<eLabel position="560,800" size="15,40" backgroundColor="#00e8c81e" />
-		<widget source="key_yellow" render="Label" position="585,795" size="230,50" font="Regular;28" valign="center" />
-		<eLabel position="825,800" size="15,40" backgroundColor="#001e5ae0" />
-		<widget source="key_blue" render="Label" position="850,795" size="230,50" font="Regular;28" valign="center" />
+		<widget source="info" render="Label" position="30,675" size="1040,120" font="Regular;28" foregroundColor="#00cccccc" />
+		<eLabel position="30,840" size="15,40" backgroundColor="#00e01e1e" />
+		<widget source="key_red" render="Label" position="55,835" size="230,50" font="Regular;28" valign="center" />
+		<eLabel position="295,840" size="15,40" backgroundColor="#0016a016" />
+		<widget source="key_green" render="Label" position="320,835" size="230,50" font="Regular;28" valign="center" />
+		<eLabel position="560,840" size="15,40" backgroundColor="#00e8c81e" />
+		<widget source="key_yellow" render="Label" position="585,835" size="230,50" font="Regular;28" valign="center" />
+		<eLabel position="825,840" size="15,40" backgroundColor="#001e5ae0" />
+		<widget source="key_blue" render="Label" position="850,835" size="230,50" font="Regular;28" valign="center" />
 	</screen>"""
 
 	def __init__(self, session):
 		Screen.__init__(self, session)
-		self.setTitle("Hardware-Equalizer (HDMI / S/PDIF)")
+		self.setTitle("Hardware-Equalizer & Werbe-Bremse")
 		self["key_red"] = StaticText("Abbrechen")
 		self["key_green"] = StaticText("Speichern")
 		self["key_yellow"] = StaticText("Neutral")
@@ -124,15 +147,24 @@ class HardwareEQSetup(ConfigListScreen, Screen):
 			"yellow": self.reset,
 			"blue": self.toggle,
 		}, -2)
+		self.eq_info = ""
+		self.timer = eTimer()
+		try:
+			self.timer_conn = self.timer.timeout.connect(self.tick)
+		except AttributeError:
+			self.timer.callback.append(self.tick)
 		self.build()
 		self.onLayoutFinish.append(self.update)
+		self.onClose.append(self.timer.stop)
 
 	def build(self):
 		cfg = config.plugins.hardwareeq
 		lst = [
+			getConfigListEntry("Werbe-Bremse (Lautstärke-Automatik)", cfg.agc),
 			getConfigListEntry("Equalizer aktiv", cfg.enabled),
 			getConfigListEntry("Voreinstellung", cfg.preset),
 			getConfigListEntry("Gesamtpegel (zusätzlich leiser)", cfg.level),
+			getConfigListEntry("Übersteuerungsschutz", cfg.protect),
 		]
 		for label, band in zip(eqmath.BAND_LABELS, BANDS_CFG):
 			lst.append(getConfigListEntry("Band %s" % label, band))
@@ -158,18 +190,43 @@ class HardwareEQSetup(ConfigListScreen, Screen):
 		self.update()
 
 	def update(self):
-		preamp = apply_settings()
+		res = apply_settings()
 		cfg = config.plugins.hardwareeq
 		if not cfg.enabled.value:
-			txt = "Equalizer ist aus (Ton unverändert)."
-		elif preamp is None:
+			txt = "Equalizer ist aus."
+		elif res is None:
 			txt = "Fehler: Treibermodul konnte nicht geladen werden."
 		else:
+			preamp, boost = res
 			status = read_status()
 			names = {"MAI(HDMI)": "HDMI", "SPDIF": "S/PDIF", "DAC": "DAC"}
 			outs = [names.get(l.split()[0], l.split()[0]) for l in status.splitlines() if l.endswith(" EQ")]
-			txt = "Vorverstärkung: %.1f dB (schützt vor Übersteuerung)\nAktiv auf: %s" % (
-				preamp, ", ".join(outs) if outs else "keinem Ausgang (Passthrough/Mehrkanal?)")
+			where = ", ".join(outs) if outs else "keinem Ausgang (Passthrough/Mehrkanal?)"
+			if boost > 0.05 and not cfg.protect.value:
+				txt = "EQ aktiv auf %s. Anhebung bis %+.1f dB" % (where, boost)
+			elif preamp < -0.05:
+				txt = "EQ aktiv auf %s. Vorverstärkung %.1f dB" % (where, preamp)
+			else:
+				txt = "EQ aktiv auf %s." % where
+		self.eq_info = txt
+		self.tick()
+		if cfg.agc.value != "0":
+			self.timer.start(1000, False)
+		else:
+			self.timer.stop()
+
+	def tick(self):
+		txt = self.eq_info
+		if config.plugins.hardwareeq.agc.value != "0":
+			a = read_agc()
+			if not a.get("reference_valid"):
+				txt += "\nWerbe-Bremse: lernt den Pegel des Programms ..."
+			elif a.get("gain", 0) <= -500:
+				txt += "\nWerbe-Bremse: senkt gerade um %.1f dB ab" % (-a["gain"] / 1000.0)
+			else:
+				txt += "\nWerbe-Bremse: bereit (keine Absenkung)"
+			if "loudness" in a and "reference" in a and a.get("reference_valid"):
+				txt += "  [Lautheit %.0f, Bezug %.0f LUFS]" % (a["loudness"] / 1000.0, a["reference"] / 1000.0)
 		self["info"].setText(txt)
 
 	def reset(self):
@@ -177,6 +234,7 @@ class HardwareEQSetup(ConfigListScreen, Screen):
 			b.value = "0"
 		config.plugins.hardwareeq.preset.value = "flat"
 		config.plugins.hardwareeq.level.value = "0"
+		config.plugins.hardwareeq.protect.value = False
 		self["config"].l.setList(self["config"].list)
 		self.update()
 
@@ -205,7 +263,8 @@ def main(session, **kwargs):
 
 
 def sessionstart(reason, **kwargs):
-	if reason == 0 and config.plugins.hardwareeq.enabled.value:
+	cfg = config.plugins.hardwareeq
+	if reason == 0 and (cfg.enabled.value or cfg.agc.value != "0"):
 		try:
 			apply_settings()
 		except Exception, e:
@@ -215,6 +274,6 @@ def sessionstart(reason, **kwargs):
 def Plugins(**kwargs):
 	return [
 		PluginDescriptor(where=PluginDescriptor.WHERE_SESSIONSTART, fnc=sessionstart),
-		PluginDescriptor(name="Hardware-Equalizer", description="Klangregelung für HDMI- und S/PDIF-Ton",
+		PluginDescriptor(name="Hardware-Equalizer", description="Klangregelung und Werbe-Bremse für HDMI- und S/PDIF-Ton",
 			where=[PluginDescriptor.WHERE_PLUGINMENU, PluginDescriptor.WHERE_EXTENSIONSMENU], fnc=main),
 	]

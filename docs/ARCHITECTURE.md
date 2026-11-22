@@ -113,6 +113,32 @@ mit einem Testfilter `b0 = 0,1, a1 = 0,9` gemessen: Tiefpass mit −4,1 dB bei 1
 
 `BAPE_EqualizerStage_SetSettings()` überträgt neue Koeffizienten im laufenden Betrieb.
 
+## Werbe-Bremse (Lautstärke-Automatik)
+
+Die fertigen Pegelregler der BAPE-Bibliothek (`BAPE_AutoVolumeLevel`, `BAPE_TruVolume`,
+`BAPE_DolbyVolume`) sind im Treiber zwar vorhanden, laufen aber auf dem Audio-DSP – und dessen Firmware
+(`BDSP_IMG_*`) enthält nur Decoder, Mixer, SRC und Fade, **nicht** AVL, TruVolume oder Dolby Volume.
+Deshalb regelt das Modul selbst:
+
+```
+Decoder ─stereo─┬─▶ Zwischen-Mixer (Eingangslautstärke = Regelgröße) ─▶ EQ ─▶ Ausgänge
+                └─▶ AGC-Mixer ─▶ OutputCapture #2 ─▶ Kernel-Thread
+```
+
+- **Messung:** Der Thread liest alle ~30 ms den Capture-Puffer (32-Bit-Stereo, 48 kHz), filtert mit der
+  K-Gewichtung aus ITU-R BS.1770 (zwei Biquads, Q28-Festkomma) und bildet alle 40 ms einen Block.
+  Kurzzeit-Lautheit: exponentiell geglättet (~320 ms). Abgleich gegen eine Python-Referenz: ±1 dB.
+- **Bezugspegel:** nach Umschalten/Stille Mittelwert der ersten 3 s, dann langsamer Nachlauf
+  (+0,6 dB/min, −1,2 dB/min; in der ersten Minute 10× schneller).
+- **Kennlinie:** Liegt die Lautheit mehr als *margin* über dem Bezug, wird mit *ratio* komprimiert,
+  begrenzt auf *maxred*. Attack ≈ 0,25 s (exponentiell), Release 1,5 dB/s. Nie Verstärkung > 0 dB.
+- **Stellglied:** `BAPE_Mixer_SetInputVolume()` am Zwischen-Mixer (264-Byte-Struktur: 8×8-Matrix in
+  1.23-Festkomma, `0x800000` = 1,0; die Diagonale wird skaliert). Die Treiber-Lautstärke von Enigma2
+  wirkt dagegen über `BAPE_SetOutputVolume()` an den Ausgängen – die beiden kommen sich nicht in die Quere.
+
+Logarithmus und Verstärkungsfaktoren kommen aus Tabellen (`kernel/dm920eq_tables.h`,
+erzeugt von `tools/gen_tables.py`), weil im Kernel keine Fließkommazahlen erlaubt sind.
+
 ## Kernel-Schnittstelle `/proc/dm920eq/`
 
 | Datei | Richtung | Inhalt |
@@ -120,6 +146,7 @@ mit einem Testfilter `b0 = 0,1, a1 = 0,9` gemessen: Tiefpass mit −4,1 dB bei 1
 | `biquads` | schreiben | `N c0 c1 … c(5N-1)` – N Biquads, je `b0 b1 b2 a1 a2` als Q5.26-Ganzzahlen |
 | `gain` | lesen/schreiben | einfacher Pegel in Promille (0–1000, nur absenken) |
 | `status` | lesen | welcher Ausgang am EQ hängt, ob die Treiber-Umleitung aktiv ist |
+| `agc` | lesen/schreiben | Werbe-Bremse: schreiben `0`–`3` (aus/leicht/mittel/stark) oder `4 <margin_mdB> <ratio×10> <maxred_mdB>`; lesen liefert Lautheit, Bezug und aktuelle Absenkung in milli-dB |
 | `capture` | lesen | nur mit `taps=1`: Mitschnitt vor und hinter dem EQ (siehe [MEASUREMENTS.md](MEASUREMENTS.md)) |
 
 Beispiel – eine Glocke bei 1 kHz mit −6 dB:
@@ -130,8 +157,9 @@ python3 tools/peq.py peak:1000:-6:1.4
 ssh root@<box> "echo '1 65040809 -124848508 60885011 124848508 -58816957' > /proc/dm920eq/biquads"
 ```
 
-Das Modul selbst begrenzt Koeffizienten nicht – die Begrenzung der Gesamtverstärkung auf ≤ 0 dB
-macht das Plugin (`eqmath.design()`), bzw. `peq.py` warnt.
+Das Modul selbst begrenzt Koeffizienten nicht. Das Plugin arbeitet standardmäßig wie ein echter EQ
+(Anhebung = lauter); mit „Übersteuerungsschutz“ rechnet `eqmath.design()` eine negative Vorverstärkung
+ein. Bei Übersteuerung begrenzt die Hardware sauber auf Vollaussteuerung (siehe MEASUREMENTS.md).
 
 ## Modulparameter
 

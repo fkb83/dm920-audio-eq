@@ -76,16 +76,22 @@ def max_gain_db(biquads):
 	return 20.0 * math.log10(max(response(biquads, f) for f in _freqs()))
 
 
-def design(gains, level_db=0.0):
-	"""Return (biquads, preamp_db). The preamp makes sure the total gain never exceeds 0 dB."""
+def design(gains, level_db=0.0, protect=False):
+	"""Return (biquads, preamp_db).
+
+	Default: a "real" EQ - boosting a band makes that band louder, everything else stays as it is.
+	protect=True adds a negative preamp so that the total gain never exceeds 0 dB
+	(no clipping, but boosting then lowers the rest)."""
 	bq = []
 	for (kind, f, q), g in zip(BANDS, gains):
 		if g:
 			bq.append(rbj(kind, f, float(g), q))
 	if not bq:
 		bq = [[1.0, 0.0, 0.0, 0.0, 0.0]]
-	peak = max_gain_db(bq)
-	preamp = -max(0.0, peak) - 0.1 if peak > 0 else 0.0   # small safety margin
+	preamp = 0.0
+	if protect:
+		peak = max_gain_db(bq)
+		preamp = -max(0.0, peak) - 0.1 if peak > 0 else 0.0   # small safety margin
 	preamp += min(0.0, float(level_db))
 	lin = 10.0 ** (preamp / 20.0)
 	bq[0] = [bq[0][0] * lin, bq[0][1] * lin, bq[0][2] * lin, bq[0][3], bq[0][4]]

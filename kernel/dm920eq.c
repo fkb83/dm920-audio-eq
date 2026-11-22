@@ -12,6 +12,10 @@
 #include <linux/uaccess.h>
 #include <linux/delay.h>
 #include <linux/slab.h>
+#include <linux/kthread.h>
+#include <linux/bitops.h>
+#include <linux/math64.h>
+#include "dm920eq_tables.h"
 
 static int gain_permille = 1000;
 module_param(gain_permille, int, 0444);
@@ -29,8 +33,10 @@ typedef int (*f_mix_add)(void *mix, void *conn, const void *s);
 typedef int (*f_dec)(void *dec);
 typedef int (*f_cap_open)(void *hApe, unsigned idx, const void *s, void **out);
 typedef int (*f_cap_consume)(void *h, unsigned n);
+typedef int (*f_mix_vol)(void *mix, void *conn, void *vol);
 
 static struct {
+	f_mix_vol mix_getvol, mix_setvol;
 	f_create3 eq_create, st_create, mix_create; f_getdef1 eq_getdef, mix_getdef, mix_getdefs, cap_getdefs;
 	f_st_getdef st_getdef; f_setstages eq_setstages;
 	f_h_ptr eq_addinput, eq_rminput, mix_rm, mix_addout, mix_rmout, st_setsettings, cap_getbuffer;
@@ -71,6 +77,7 @@ static int resolve(void)
 	SYM(cap_close, "BAPE_OutputCapture_Close"); SYM(cap_getport, "BAPE_OutputCapture_GetOutputPort");
 	SYM(cap_getbuffer, "BAPE_OutputCapture_GetBuffer"); SYM(cap_consume, "BAPE_OutputCapture_ConsumeData");
 	SYM(dec_start, "bcm_audio_decoder_start"); SYM(dec_stop, "bcm_audio_decoder_stop");
+	SYM(mix_getvol, "BAPE_Mixer_GetInputVolume"); SYM(mix_setvol, "BAPE_Mixer_SetInputVolume");
 	f = filp_open("/proc/stb/audio/audio_delay_pcm", O_RDONLY, 0);
 	if (IS_ERR(f)) return PTR_ERR(f);
 	ctx = *(char **)((char *)PDE_DATA(file_inode(f)) + 0x24);
@@ -196,6 +203,231 @@ static const struct file_operations status_fops = { .owner = THIS_MODULE, .read 
 
 static const struct file_operations gain_fops = { .owner = THIS_MODULE, .read = gain_read, .write = gain_write, .llseek = default_llseek };
 
+/* ---------------------------------------------------------------------------------------------
+ * Automatic level control ("Werbe-Bremse")
+ * A third capture taps the raw decoder output. A kernel thread measures short-term loudness
+ * (ITU-R BS.1770 K-weighting), tracks a slow programme reference and attenuates the input of
+ * the intermediate mixer when the audio gets clearly louder than that reference.
+ * It only ever attenuates (gain <= 0 dB). All levels are in milli-dB (mdB).
+ * ------------------------------------------------------------------------------------------- */
+#define AGC_CAP_INDEX   2
+#define BLOCK_FRAMES    1920            /* 40 ms at 48 kHz */
+#define SILENCE_MDB     (-60000)
+#define FS_OFFSET_MDB   (132450 + 691)  /* 20*log10(2^22) + 0.691 (BS.1770 offset) */
+#define VOLSZ           264
+
+static struct task_struct *agc_task;
+static void *agcmix, *agccap, *agcport;
+static u8 vol_base[VOLSZ];
+static int vol_base_ok;
+
+static struct {
+	int mode;                /* 0 off, 1 light, 2 medium, 3 strong, 4 custom */
+	int margin, ratio10, maxred;  /* mdB, ratio*10, mdB (positive) */
+	/* state */
+	s64 kst[2][2][4];        /* [ch][stage] x1 x2 y1 y2 */
+	u64 acc; int nacc;
+	s64 ms_short;            /* smoothed mean square */
+	int loud, ref, gain;     /* mdB */
+	s64 ref_u;               /* reference in micro-dB */
+	int ref_valid, init_n, warmup; s64 init_acc;
+	int silent_blocks, was_running, applied_idx;
+	u32 loops, empty, bytes, blocks, maxchunk, dbg_d0, dbg_d4, dbg_wrap;
+} A = { .applied_idx = -1 };
+
+static const struct { int margin, ratio10, maxred; } agc_presets[4] = {
+	{ 0, 10, 0 }, { 4000, 20, 6000 }, { 3000, 30, 10000 }, { 2000, 50, 15000 },
+};
+
+static int mdb_from_energy(u64 e)   /* 10*log10(e) in mdB, e > 0 */
+{
+	int msb = fls64(e) - 1; u32 frac; s64 l2;
+	if (msb >= 8) frac = (u32)(e >> (msb - 8)) & 0xff; else frac = (u32)(e << (8 - msb)) & 0xff;
+	l2 = ((s64)msb << 16) + log2_frac_q16[frac];          /* log2 in Q16 */
+	return (int)((l2 * 3010300LL) >> 16) / 1000;           /* * 10*log10(2) */
+}
+
+static void agc_apply_gain(int gain_mdb)
+{
+	u8 v[VOLSZ]; int idx, i; u32 g;
+	if (!vol_base_ok) return;
+	idx = (-gain_mdb + 50) / 100;
+	if (idx < 0) idx = 0;
+	if (idx > 300) idx = 300;
+	if (idx == A.applied_idx) return;
+	g = gain_q16[idx];
+	memcpy(v, vol_base, VOLSZ);
+	for (i = 0; i < 64; i++) {
+		u32 c = ((u32 *)vol_base)[i];
+		if (c) ((u32 *)v)[i] = (u32)(((u64)c * g) >> 16);
+	}
+	if (!F.mix_setvol(pre, stereo, v)) A.applied_idx = idx;
+}
+
+static void agc_reset_reference(void)
+{
+	A.ref_valid = 0; A.init_n = 0; A.init_acc = 0;
+}
+
+static void agc_block(void)
+{
+	u64 ms = div_u64(A.acc, A.nacc);
+	s64 target = 0;
+	int margin = A.margin, ratio10 = A.ratio10, maxred = A.maxred;
+
+	A.acc = 0; A.nacc = 0;
+	A.ms_short += ((s64)ms - A.ms_short) >> 3;               /* ~ 320 ms time constant */
+	A.loud = A.ms_short > 0 ? mdb_from_energy((u64)A.ms_short) - FS_OFFSET_MDB : -100000;
+
+	if (A.loud < SILENCE_MDB) {
+		if (++A.silent_blocks > 25) agc_reset_reference();  /* 1 s of silence: new programme */
+	} else {
+		A.silent_blocks = 0;
+		if (!A.ref_valid) {
+			A.init_acc += A.loud;
+			if (++A.init_n >= 75) {                          /* 3 s of audio: initial reference */
+				A.ref_u = div_s64(A.init_acc, A.init_n) * 1000LL;
+				A.ref_valid = 1;
+				A.warmup = 1500;                             /* 60 s of faster learning */
+			}
+		} else {
+			/* slow, biased follower: +0.6 dB/min up, -1.2 dB/min down
+			 * (10x faster during the first minute after a channel change) */
+			s64 d = (s64)A.loud * 1000 - A.ref_u;
+			int k = A.warmup > 0 ? 10 : 1;
+			if (A.warmup > 0) A.warmup--;
+			if (d > 0) A.ref_u += min_t(s64, d, 400 * k);   /* 0.4 mdB per 40 ms block */
+			else A.ref_u -= min_t(s64, -d, 800 * k);
+		}
+	}
+	A.ref = (int)div_s64(A.ref_u, 1000);
+
+	if (A.mode && A.ref_valid && A.loud > SILENCE_MDB) {
+		int over = A.loud - (A.ref + margin);
+		if (over > 0)
+			target = -(s64)div_s64((s64)over * (ratio10 - 10), ratio10);
+		if (target < -maxred) target = -maxred;
+	}
+	/* attack: exponential (~0.25 s), release: 1.5 dB/s */
+	if ((int)target < A.gain) A.gain += ((int)target - A.gain) / 6;
+	else A.gain = min_t(int, (int)target, A.gain + 60);
+	if (!A.mode) A.gain = 0;
+	agc_apply_gain(A.gain);
+}
+
+static inline s64 kfilt(const s64 *c, s64 *s, s64 x)
+{
+	s64 y = (c[0] * x + c[1] * s[0] + c[2] * s[1] - c[3] * s[2] - c[4] * s[3]) >> 28;
+	s[1] = s[0]; s[0] = x; s[3] = s[2]; s[2] = y;
+	return y;
+}
+
+static void agc_process(const s32 *p, u32 frames)
+{
+	u32 i;
+	for (i = 0; i < frames; i++) {
+		int ch;
+		for (ch = 0; ch < 2; ch++) {
+			s64 x = p[2 * i + ch] >> 9;                       /* 23 bit */
+			s64 y = kfilt(kw2, A.kst[ch][1], kfilt(kw1, A.kst[ch][0], x));
+			A.acc += (u64)(y * y) >> 4;
+		}
+		if (++A.nacc >= BLOCK_FRAMES) {
+			A.blocks++;
+			A.acc <<= 4;
+			agc_block();
+		}
+	}
+}
+
+static int agc_thread(void *unused)
+{
+	while (!kthread_should_stop()) {
+		u8 d[96]; int running = *(volatile u32 *)(dec + 0xf4);
+		if (running && !A.was_running) agc_reset_reference();   /* zap / restart */
+		A.was_running = running;
+		A.loops++;
+		if (agccap && !F.cap_getbuffer(agccap, d)) {
+			const s32 *p = *(const s32 **)(d + 8);
+			u32 n = *(u32 *)(d + 72) & ~7u;
+			A.dbg_d0 = d[0]; A.dbg_d4 = *(u32 *)(d + 4); A.dbg_wrap = *(u32 *)(d + 76);
+			if (!n) A.empty++;
+			A.bytes += n; if (n > A.maxchunk) A.maxchunk = n;
+			if (n > 64 * 1024) n = 64 * 1024;
+			if (n && p) {
+				mutex_lock(&cfg_lock);
+				agc_process(p, n / 8);
+				mutex_unlock(&cfg_lock);
+				F.cap_consume(agccap, n);
+			}
+		}
+		msleep_interruptible(30);
+	}
+	return 0;
+}
+
+static void agc_set_mode(int mode, int margin, int ratio10, int maxred)
+{
+	mutex_lock(&cfg_lock);
+	if (mode >= 0 && mode < 4) {
+		margin = agc_presets[mode].margin; ratio10 = agc_presets[mode].ratio10; maxred = agc_presets[mode].maxred;
+	}
+	A.mode = mode; A.margin = margin;
+	A.ratio10 = clamp(ratio10, 10, 200);
+	A.maxred = clamp(maxred, 0, 30000);
+	mutex_unlock(&cfg_lock);
+	pr_info("dm920eq: agc mode=%d margin=%d ratio=%d/10 maxred=%d\n", A.mode, A.margin, A.ratio10, A.maxred);
+}
+
+/* write: "<mode>" (0-3) or "4 <margin_mdB> <ratio*10> <maxred_mdB>" */
+static ssize_t agc_write(struct file *file, const char __user *buf, size_t cnt, loff_t *pos)
+{
+	char tmp[64]; int m = 0, a = 0, b = 10, c = 0, n;
+	if (cnt >= sizeof(tmp)) return -EINVAL;
+	if (copy_from_user(tmp, buf, cnt)) return -EFAULT;
+	tmp[cnt] = 0;
+	n = sscanf(tmp, "%d %d %d %d", &m, &a, &b, &c);
+	if (n < 1 || m < 0 || m > 4 || (m == 4 && n != 4)) return -EINVAL;
+	agc_set_mode(m, a, b, c);
+	return cnt;
+}
+static ssize_t agc_read(struct file *file, char __user *buf, size_t cnt, loff_t *pos)
+{
+	char tmp[400];
+	int l = snprintf(tmp, sizeof(tmp), "mode %d\nloudness %d\nreference %d\ngain %d\nreference_valid %d\nactive %d\n"
+		"debug loops=%u empty=%u bytes=%u blocks=%u maxchunk=%u il=%u nbuf=%u wrap=%u\n",
+		A.mode, A.loud, A.ref, A.gain, A.ref_valid, agccap != NULL,
+		A.loops, A.empty, A.bytes, A.blocks, A.maxchunk, A.dbg_d0, A.dbg_d4, A.dbg_wrap);
+	return simple_read_from_buffer(buf, cnt, pos, tmp, l);
+}
+static const struct file_operations agc_fops = { .owner = THIS_MODULE, .read = agc_read, .write = agc_write, .llseek = default_llseek };
+
+static void setup_agc(void)
+{
+	u8 mxs[256], ms[16], cs[32]; int ret;
+	if (F.mix_getvol(pre, stereo, vol_base) == 0) vol_base_ok = 1;
+	pr_info("dm920eq: base input volume %08x %08x %08x %08x muted=%d\n", ((u32 *)vol_base)[0], ((u32 *)vol_base)[1],
+		((u32 *)vol_base)[8], ((u32 *)vol_base)[9], vol_base[256]);
+	F.mix_getdefs(mxs);
+	if (F.mix_create(hApe, mxs, &agcmix)) { agcmix = NULL; return; }
+	F.mix_getdef(ms); ms[0] = 1;
+	F.mix_add(agcmix, stereo, ms);
+	F.cap_getdefs(cs);
+	ret = F.cap_open(hApe, AGC_CAP_INDEX, cs, &agccap);
+	if (ret) { pr_err("dm920eq: agc capture open ret=%d\n", ret); agccap = NULL; return; }
+	F.cap_getport(agccap, &agcport);
+	ret = F.mix_addout(agcmix, agcport);
+	pr_info("dm920eq: agc tap ready (addout ret=%d)\n", ret);
+}
+static void teardown_agc(void)
+{
+	if (!agcmix) return;
+	if (agccap) { F.mix_rmout(agcmix, agcport); F.cap_close(agccap); agccap = NULL; }
+	F.mix_rm(agcmix, stereo);
+	F.mix_destroy(agcmix); agcmix = NULL;
+	if (vol_base_ok) F.mix_setvol(pre, stereo, vol_base);
+}
+
 static void setup_taps(void)
 {
 	u8 mxs[256], ms[16], cs[32]; int i, ret; void *src[2] = { stereo, eqconn };
@@ -260,6 +492,7 @@ static int __init eq_init(void)
 	/* let the driver route the EQ output wherever it would route plain stereo */
 	*(void **)(dev + 0xfc) = eqconn;
 	if (taps) setup_taps();
+	setup_agc();
 	if (running) F.dec_start(dec);
 	mutex_unlock(dec_mutex);
 
@@ -268,7 +501,12 @@ static int __init eq_init(void)
 		proc_create("gain", 0644, pdir, &gain_fops);
 		proc_create("biquads", 0200, pdir, &bq_fops);
 		proc_create("status", 0444, pdir, &status_fops);
+		proc_create("agc", 0644, pdir, &agc_fops);
 		if (taps) proc_create("capture", 0444, pdir, &cap_fops);
+	}
+	if (agccap) {
+		agc_task = kthread_run(agc_thread, NULL, "dm920eq-agc");
+		if (IS_ERR(agc_task)) agc_task = NULL;
 	}
 	pr_info("dm920eq: active, gain=%d/1000\n", gain_permille);
 	return 0;
@@ -281,11 +519,18 @@ err_st: F.st_destroy(stage);
 static void __exit eq_exit(void)
 {
 	u8 ms[16]; int running, p, ret;
-	if (pdir) { remove_proc_entry("capture", pdir); remove_proc_entry("gain", pdir); remove_proc_entry("biquads", pdir); remove_proc_entry("status", pdir); remove_proc_entry("dm920eq", NULL); }
+	if (agc_task) kthread_stop(agc_task);
+	if (pdir) {
+		if (taps) remove_proc_entry("capture", pdir);
+		remove_proc_entry("gain", pdir); remove_proc_entry("biquads", pdir);
+		remove_proc_entry("status", pdir); remove_proc_entry("agc", pdir);
+		remove_proc_entry("dm920eq", NULL);
+	}
 	mutex_lock(dec_mutex);
 	running = *(u32 *)(dec + 0xf4);
 	if (running) F.dec_stop(dec);
 	if (*(void **)(dev + 0xfc) == eqconn) *(void **)(dev + 0xfc) = stereo;
+	teardown_agc();
 	teardown_taps();
 	for (p = 0; p < 5; p++) {
 		void *mix = *(void **)(dev + mix_off[p]);

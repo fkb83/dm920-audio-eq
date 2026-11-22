@@ -1,7 +1,8 @@
 # DM920 Audio EQ
 
-**Hardware-Equalizer für die Dreambox DM920** – ein Kernelmodul plus Enigma2-Plugin, das den
-im Broadcom-Audiochip vorhandenen, aber nie freigeschalteten Equalizer nutzbar macht.
+**Hardware-Equalizer und Werbe-Bremse für die Dreambox DM920** – ein Kernelmodul plus
+Enigma2-Plugin, das den im Broadcom-Audiochip vorhandenen, aber nie freigeschalteten Equalizer
+nutzbar macht und eine automatische Lautstärkeregelung gegen zu laute Werbung mitbringt.
 
 Der EQ sitzt direkt im Audiopfad zwischen Decoder und den Ausgängen **HDMI, S/PDIF und DAC**.
 Er rechnet in der Audio-Hardware des Chips – ohne CPU-Last, ohne Verzögerung, für Live-TV,
@@ -11,16 +12,21 @@ Aufnahmen und jeden Sender.
 
 > *English summary:* Kernel module + Enigma2 plugin that enables the unused Broadcom BAPE hardware
 > equalizer of the Dreambox DM920 (BCM7439) and inserts it between the audio decoder and the
-> HDMI / S/PDIF outputs. 8-band parametric EQ, presets, automatic headroom so the output never gets
-> louder than without EQ. Verified by measuring the audio before and after the EQ inside the chip.
+> HDMI / S/PDIF outputs. 8-band parametric EQ with presets, plus an automatic level control
+> ("ad brake") that measures loudness (ITU-R BS.1770) and attenuates when audio gets clearly louder
+> than the programme. Verified by measuring the audio before and after the EQ inside the chip.
 
 ## Funktionen
 
 - **8 Bänder** (60 Hz … 15 kHz, Shelf + Glockenfilter), je ±12 dB, Änderungen sofort hörbar
+- **Wie ein echter EQ:** Bass anheben macht den Bass lauter, der Rest bleibt unverändert
 - **Voreinstellungen:** Neutral, Mehr Bass, Sprache/Dialog, Loudness, Mehr Höhen, Nachtmodus
-- **Automatische Vorverstärkung:** die Gesamtverstärkung bleibt immer ≤ 0 dB – der EQ kann nicht übersteuern
-  und macht nichts lauter, als es ohne EQ wäre (wichtig, wenn Lautsprecher direkt dranhängen)
+- **Übersteuerungsschutz** (optional): senkt beim Anheben automatisch so weit ab, dass die Gesamtverstärkung
+  ≤ 0 dB bleibt. Ohne Schutz begrenzt die Hardware bei Vollaussteuerung sauber (kein Überlauf, gemessen)
 - **Gesamtpegel** zum zusätzlichen Absenken
+- **Werbe-Bremse** (Lautstärke-Automatik, *leicht / mittel / stark*): misst laufend die Lautheit und senkt
+  ab, wenn es deutlich lauter wird als das laufende Programm – z. B. bei Werbung oder Trailern. Sie senkt nur
+  ab, hebt nie an. Live-Anzeige der aktuellen Absenkung im Plugin
 - Übersteht Senderwechsel und Wechsel des Tonformats (MPEG ↔ AC3 ↔ Dolby Digital 5.1 Downmix)
 - Startet automatisch mit Enigma2, Einstellungen bleiben gespeichert
 
@@ -80,7 +86,21 @@ und startet Enigma2 neu.
 | Gelb | Alle Bänder auf Neutral |
 | Blau | EQ an/aus |
 
-Unten zeigt das Plugin die aktuelle Vorverstärkung und auf welchen Ausgängen der EQ gerade wirkt.
+Unten zeigt das Plugin, auf welchen Ausgängen der EQ wirkt, die stärkste Anhebung und – bei
+eingeschalteter Werbe-Bremse – live, ob und wie stark gerade abgesenkt wird.
+
+### Werbe-Bremse
+
+| Stufe | setzt ein ab | Verhältnis | max. Absenkung |
+|---|---|---|---|
+| leicht | 4 dB über Programmpegel | 2:1 | −6 dB |
+| mittel | 3 dB über Programmpegel | 3:1 | −10 dB |
+| stark | 2 dB über Programmpegel | 5:1 | −15 dB |
+
+Den Programmpegel lernt sie selbst: nach dem Umschalten in 3 s grob, in der ersten Minute zügig, danach
+langsam (+0,6 dB/min nach oben, −1,2 dB/min nach unten), damit eine Werbepause nicht als „neuer
+Normalpegel“ gelernt wird. Absenken dauert etwa eine halbe Sekunde, zurück geht es mit 1,5 dB/s.
+Ein schneller Spitzen-Limiter ist das nicht – kurze Knalle gehen durch.
 
 ### Wichtig: Downmix einstellen
 
@@ -94,7 +114,9 @@ Kurzfassung – ausführlich in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md):
 
 ```
 vorher:   Decoder ──stereo──▶ HDMI-Mixer ──▶ HDMI
-nachher:  Decoder ──stereo──▶ Zwischen-Mixer ──▶ BAPE-Equalizer ──▶ HDMI-/S/PDIF-/DAC-Mixer
+nachher:  Decoder ──stereo──┬─▶ Zwischen-Mixer ──▶ BAPE-Equalizer ──▶ HDMI-/S/PDIF-/DAC-Mixer
+                            │      ▲ Lautstärke
+                            └─▶ Messabgriff ──▶ Werbe-Bremse (Kernel-Thread)
 ```
 
 1. Der Broadcom-Audiotreiber `bcm7439.ko` enthält die komplette *BAPE*-Audio-Engine inklusive
@@ -105,6 +127,9 @@ nachher:  Decoder ──stereo──▶ Zwischen-Mixer ──▶ BAPE-Equalizer 
    seinen Stereo-Ausgang verwaltet. Dadurch verdrahtet der Treiber bei jedem Formatwechsel selbst den EQ.
 4. Das Plugin rechnet die Bänder (RBJ-Biquads) in Festkomma-Koeffizienten um und schreibt sie nach
    `/proc/dm920eq/biquads`. Die Hardware übernimmt sie im laufenden Betrieb.
+5. Für die Werbe-Bremse schneidet ein weiterer Abgriff (`BAPE_OutputCapture`) den Decoder-Ausgang mit.
+   Ein Kernel-Thread misst die Lautheit nach ITU-R BS.1770 und regelt die Eingangslautstärke des
+   Zwischen-Mixers; die Mixer-Hardware blendet weich über.
 
 Entladen (`rmmod dm920eq`) stellt den Originalzustand wieder her.
 

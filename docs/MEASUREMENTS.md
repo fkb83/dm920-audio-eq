@@ -62,8 +62,8 @@ auflöst.
 
 ### Über die Plugin-Oberfläche
 
-Preset „Mehr Bass“ (+6/+4/+1 dB bei 60/150/400 Hz) per Fernbedienung gewählt, inklusive automatischer
-Vorverstärkung von −6,1 dB:
+Preset „Mehr Bass“ (+6/+4/+1 dB bei 60/150/400 Hz) per Fernbedienung gewählt (Version 1.0, damals mit automatischer
+Vorverstärkung von −6,1 dB – heute der optionale Übersteuerungsschutz):
 
 | Frequenz | 50 Hz | 200 Hz | 500 Hz | 1 kHz | 5 kHz |
 |---|---|---|---|---|---|
@@ -80,6 +80,34 @@ Kette neu auf (`streamtype set`):
 | AC3 (Ausgangszustand) | ja | −9,0 dB |
 | MPEG Stereo | ja | −9,0 dB |
 | Dolby Digital 5.1 (Downmix) | ja | −8,9 dB |
+
+### Übersteuerung
+
+Ausgänge stummgeschaltet, Breitband-Anhebung um +12 dB auf laufendes Programm (Spitzen bei 0,26 FS):
+
+| | Ergebnis |
+|---|---|
+| Verstärkung unterhalb der Vollaussteuerung | +12,00 dB |
+| Ausgang bei Übersteuerung | sauber auf 1,000 FS begrenzt |
+| Samples mit Vorzeichensprung (Überlauf) | 0 von 46 übersteuerten |
+
+Die Hardware sättigt also, statt überzulaufen – Anhebungen ohne Ausgleich können verzerren, aber nicht krachen.
+
+### Werbe-Bremse
+
+Lautheitsmessung im Kernel gegen eine Python-Implementierung von BS.1770 auf demselben Mitschnitt:
+Abweichung um 1 dB (unterschiedliche Fensterlängen).
+
+Regelverhalten mit künstlicher Schwelle (10 dB unter dem Bezugspegel, 5:1), damit sie auf normales
+Programm reagieren muss:
+
+| | erwartet | gemessen |
+|---|---|---|
+| Absenkung bei 6,9 dB Überschreitung | −5,5 dB | −5,4 dB (Anzeige), −4,6 dB (Signal, Pegel schwankte) |
+| Freigabe | 1,5 dB/s | −5,6 → −4,1 → −2,6 → −1,0 → 0 dB im Sekundentakt |
+
+Im normalen Programm (Stufe *mittel*, 60 s VOX HD) blieb die Absenkung bei 0 dB (einmal −0,1 dB).
+Eine echte Werbepause wurde noch nicht mitgeschnitten.
 
 ## Was nicht gemessen wurde
 
