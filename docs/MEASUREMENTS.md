@@ -109,6 +109,38 @@ Programm reagieren muss:
 Im normalen Programm (Stufe *mittel*, 60 s VOX HD) blieb die Absenkung bei 0 dB (einmal −0,1 dB).
 Eine echte Werbepause wurde noch nicht mitgeschnitten.
 
+### Stabilität (v1.2.0)
+
+Anlass: Am 23.11.2026 hing die Box ab 06:27, während EPGRefresh im Standby Sender durchschaltete.
+Nachgestellt im laufenden Betrieb, jeweils RTL UHD_ALT (DD+, Passthrough an HDMI) → SAT.1 HD (AC3),
+gezählt wurden die Neustarts des Audio-DSP (`audio watchdog_isr`) in den 20 s danach:
+
+| Variante | DSP-Neustarts | Box |
+|---|---|---|
+| ohne Modul | 0 | ok |
+| v1.1.0 (Abgriff mit eigenem Mixer am Decoder) | 35–42 | Thread stürzte im Morgen-Fall ab → Box hing |
+| v1.2.0-Vorstufe: alter Abgriff, aber mit Treibersperren | 35 | ok, Thread lief weiter |
+| nur EQ, ohne Werbe-Bremse | 0 | ok |
+| v1.2.0 (Abgriff am DAC-Mixer) | 0 (dreimal wiederholt) | ok |
+
+Rundgang durch die Favoriten (Das Erste, ZDF, UHD1, RTL, 3sat, RTL UHD_ALT, arte, SAT.1, VOX; MPEG, AC3,
+DD+ gemischt): 0 DSP-Neustarts, die EQ-Kette wurde genau nach den beiden DD+-Sendern neu verknüpft.
+
+**EQ nach DD+:** Der EQ-Pegel wurde auf −12 dB gestellt und die Wirkung am Abgriff gemessen:
+
+| Zustand | Wirkung |
+|---|---|
+| frisch geladen | −12 / −7 dB (Programm schwankt) |
+| nach DD+ → AC3, v1.1.0 | ±0 dB – EQ wirkungslos |
+| nach Neu-Verknüpfen | −13 dB |
+| v1.2.0 automatisch nach DD+ | −8,5 / −10,3 dB |
+
+**Werbe-Bremse misst unabhängig von Lautstärke und eigener Absenkung:**
+
+- Box-Lautstärke 9 → 0 → 9: Lautheit −20,6 / −22,5 / −20,9 dB (Schwankung im Programm, kein Einbruch).
+- Absenkung erzwungen (−8 … −10 dB): unkorrigierter Messwert fällt um 9–11 dB, die korrigierte Lautheit
+  bleibt beim Bezugspegel (−18 … −20 dB bei Bezug −20 dB).
+
 ## Was nicht gemessen wurde
 
 Der Abgriff hinter dem EQ ist derselbe Connector, an dem auch der HDMI-Mixer hängt. Das analoge

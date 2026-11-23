@@ -114,9 +114,9 @@ Kurzfassung – ausführlich in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md):
 
 ```
 vorher:   Decoder ──stereo──▶ HDMI-Mixer ──▶ HDMI
-nachher:  Decoder ──stereo──┬─▶ Zwischen-Mixer ──▶ BAPE-Equalizer ──▶ HDMI-/S/PDIF-/DAC-Mixer
-                            │      ▲ Lautstärke
-                            └─▶ Messabgriff ──▶ Werbe-Bremse (Kernel-Thread)
+nachher:  Decoder ──stereo──▶ Zwischen-Mixer ──▶ BAPE-Equalizer ──▶ HDMI-/S/PDIF-/DAC-Mixer
+                               ▲ Lautstärke                           └─▶ Messabgriff
+                               └──────────── Werbe-Bremse (Kernel-Thread) ◀──┘
 ```
 
 1. Der Broadcom-Audiotreiber `bcm7439.ko` enthält die komplette *BAPE*-Audio-Engine inklusive
@@ -127,11 +127,23 @@ nachher:  Decoder ──stereo──┬─▶ Zwischen-Mixer ──▶ BAPE-Equa
    seinen Stereo-Ausgang verwaltet. Dadurch verdrahtet der Treiber bei jedem Formatwechsel selbst den EQ.
 4. Das Plugin rechnet die Bänder (RBJ-Biquads) in Festkomma-Koeffizienten um und schreibt sie nach
    `/proc/dm920eq/biquads`. Die Hardware übernimmt sie im laufenden Betrieb.
-5. Für die Werbe-Bremse schneidet ein weiterer Abgriff (`BAPE_OutputCapture`) den Decoder-Ausgang mit.
-   Ein Kernel-Thread misst die Lautheit nach ITU-R BS.1770 und regelt die Eingangslautstärke des
-   Zwischen-Mixers; die Mixer-Hardware blendet weich über.
+5. Für die Werbe-Bremse hängt ein Abgriff (`BAPE_OutputCapture`) am DAC-Mixer des Treibers. Ein
+   Kernel-Thread misst die Lautheit nach ITU-R BS.1770, rechnet die eigene Absenkung heraus und regelt
+   die Eingangslautstärke des Zwischen-Mixers; die Mixer-Hardware blendet weich über.
+6. Alle Treiberaufrufe laufen unter den Sperren des Treibers selbst. Nach Sendern mit DD+-Passthrough
+   verknüpft der Thread die EQ-Kette neu, weil der Treiber sie sonst ins Leere laufen lässt.
 
 Entladen (`rmmod dm920eq`) stellt den Originalzustand wieder her.
+
+## Versionen
+
+- **1.2.0** – Stabilität: Die Box konnte einfrieren, wenn der Audio-DSP neu startete, während die
+  Werbe-Bremse maß (Absturz im Mess-Thread, Treibersperre blieb belegt). Der Messabgriff löste außerdem
+  selbst DSP-Abstürze aus, wenn ein DD+-Sender (Passthrough) auf einen AC3-Sender folgte. Und nach jedem
+  DD+-Sender wirkte der EQ bis zum Neustart nicht mehr. Alle drei Fehler sind behoben und auf der Box
+  nachgestellt und gemessen (siehe [docs/MEASUREMENTS.md](docs/MEASUREMENTS.md)).
+- **1.1.0** – echter EQ (Anheben = lauter), Werbe-Bremse.
+- **1.0.0** – erste Version.
 
 ## Repository
 

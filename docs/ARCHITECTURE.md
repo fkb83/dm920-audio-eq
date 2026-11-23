@@ -121,13 +121,22 @@ Die fertigen Pegelregler der BAPE-Bibliothek (`BAPE_AutoVolumeLevel`, `BAPE_TruV
 Deshalb regelt das Modul selbst:
 
 ```
-Decoder ─stereo─┬─▶ Zwischen-Mixer (Eingangslautstärke = Regelgröße) ─▶ EQ ─▶ Ausgänge
-                └─▶ AGC-Mixer ─▶ OutputCapture #2 ─▶ Kernel-Thread
+Decoder ─stereo─▶ Zwischen-Mixer (Eingangslautstärke = Regelgröße) ─▶ EQ ─▶ HDMI-/S/PDIF-Mixer
+                                                                       └──▶ DAC-Mixer ─┬─▶ DAC
+                                                                                       └─▶ OutputCapture #2 ─▶ Kernel-Thread
 ```
 
+- **Messpunkt:** Der Abgriff ist ein zusätzlicher Ausgang des DAC-Mixers des Treibers, liegt also hinter
+  EQ und Stellglied. Ein eigener Mixer direkt am Decoder (so bis v1.1.0) hält den PCM-Zweig des Decoders
+  auch dann aktiv, wenn der Treiber auf DD+/DTS-Passthrough schaltet. Beim Zurückschalten auf PCM stürzt
+  der Audio-DSP dann im Sekundentakt ab und wird vom Treiber-Watchdog neu gestartet (gemessen: 42 Resets in
+  20 s, ohne Modul 0). Den DAC-Mixer legt der Treiber im Passthrough selbst still.
 - **Messung:** Der Thread liest alle ~30 ms den Capture-Puffer (32-Bit-Stereo, 48 kHz), filtert mit der
-  K-Gewichtung aus ITU-R BS.1770 (zwei Biquads, Q28-Festkomma) und bildet alle 40 ms einen Block.
-  Kurzzeit-Lautheit: exponentiell geglättet (~320 ms). Abgleich gegen eine Python-Referenz: ±1 dB.
+  K-Gewichtung aus ITU-R BS.1770 (zwei Biquads, Q28-Festkomma) und bildet alle 40 ms einen Block. Die
+  eigene Absenkung wird pro Block wieder herausgerechnet. Der EQ verschiebt Messwert und Bezugspegel
+  gleichermaßen und löst die Bremse deshalb nicht aus. Die Box-Lautstärke wirkt nur am DAC-Ausgang und
+  nicht am Abgriff. Kurzzeit-Lautheit: exponentiell geglättet (~320 ms). Abgleich gegen eine
+  Python-Referenz: ±1 dB.
 - **Bezugspegel:** nach Umschalten/Stille Mittelwert der ersten 3 s, dann langsamer Nachlauf
   (+0,6 dB/min, −1,2 dB/min; in der ersten Minute 10× schneller).
 - **Kennlinie:** Liegt die Lautheit mehr als *margin* über dem Bezug, wird mit *ratio* komprimiert,
@@ -139,14 +148,39 @@ Decoder ─stereo─┬─▶ Zwischen-Mixer (Eingangslautstärke = Regelgröße
 Logarithmus und Verstärkungsfaktoren kommen aus Tabellen (`kernel/dm920eq_tables.h`,
 erzeugt von `tools/gen_tables.py`), weil im Kernel keine Fließkommazahlen erlaubt sind.
 
+## Sperren und Treiber-Ereignisse
+
+Der Treiber ruft seine Ereignis-Handler (u. a. den Neustart des Audio-DSP nach einem Watchdog-Alarm)
+aus `b_event_task` mit seiner globalen Sperre `b_lock` auf; der Watchdog-Handler nimmt danach die
+Decoder-Mutexe. Senderwechsel und Formatwechsel laufen unter dem Decoder-Mutex. Beide bauen Mixer-
+Ausgänge ab und wieder auf, auch den Mitschnitt-Puffer (`BAPE_OutputCapture_P_Disable` gibt die
+DFIFO-Gruppe ohne Sperre frei, `BAPE_OutputCapture_ConsumeData` prüft „aktiv?“ vor der Sperre).
+
+Bis v1.1.0 rief der Thread die Capture-Funktionen ohne diese Sperren auf. Am 23.11.2026 traf er dabei
+einen DSP-Neustart: NULL-Zeiger in `BAPE_DfifoGroup_P_CommitData_isr` innerhalb der Treiber-
+Critical-Section, die danach nie wieder freigegeben wurde – Grafik-Thread von Enigma2 und Treiber-Threads
+hingen, die Box reagierte nicht mehr. Seit v1.2.0 läuft jeder BAPE-Aufruf des Moduls unter `b_lock` und
+dann dem Decoder-Mutex (dieselbe Reihenfolge wie im Treiber). Der Thread kopiert die Messdaten unter Sperre
+und rechnet ohne Sperre. Nur Laden/Entladen nimmt allein den Decoder-Mutex, weil dort der Decoder
+gestoppt und gestartet wird.
+
+## Passthrough (DD+/DTS) und EQ
+
+Bei DD+-Passthrough entfernt der Treiber den EQ-Ausgang aus allen Ausgangs-Mixern und hängt ihn beim
+Zurückschalten auf PCM wieder an. Danach verarbeitet die EQ-Kette nichts mehr: Das Signal am Ausgang
+entspricht dem unbearbeiteten Eingang, Filter und Stellglied wirken nicht (gemessen, bis v1.1.0 blieb
+das bis zum Neustart von Enigma2 so). Der Thread erkennt den Übergang Passthrough → PCM und verknüpft
+EQ-Eingang und -Ausgänge neu (`relink`, kurze Tonpause direkt nach dem Senderwechsel). Danach misst
+die volle EQ-Wirkung wieder. Die Anzahl steht in `/proc/dm920eq/agc` unter `relinks`.
+
 ## Kernel-Schnittstelle `/proc/dm920eq/`
 
 | Datei | Richtung | Inhalt |
 |---|---|---|
 | `biquads` | schreiben | `N c0 c1 … c(5N-1)` – N Biquads, je `b0 b1 b2 a1 a2` als Q5.26-Ganzzahlen |
 | `gain` | lesen/schreiben | einfacher Pegel in Promille (0–1000, nur absenken) |
-| `status` | lesen | welcher Ausgang am EQ hängt, ob die Treiber-Umleitung aktiv ist |
-| `agc` | lesen/schreiben | Werbe-Bremse: schreiben `0`–`3` (aus/leicht/mittel/stark) oder `4 <margin_mdB> <ratio×10> <maxred_mdB>`; lesen liefert Lautheit, Bezug und aktuelle Absenkung in milli-dB |
+| `status` | lesen/schreiben | lesen: welcher Ausgang am EQ hängt, ob die Treiber-Umleitung aktiv ist; schreiben `2`: EQ-Kette neu verknüpfen (Diagnose) |
+| `agc` | lesen/schreiben | Werbe-Bremse: schreiben `0`–`3` (aus/leicht/mittel/stark) oder `4 <margin_mdB> <ratio×10> <maxred_mdB>`; lesen liefert Lautheit, Bezug, aktuelle Absenkung, unkorrigierten Messwert (`measured`) und gesetzte Absenkung (`applied`) in milli-dB |
 | `capture` | lesen | nur mit `taps=1`: Mitschnitt vor und hinter dem EQ (siehe [MEASUREMENTS.md](MEASUREMENTS.md)) |
 
 Beispiel – eine Glocke bei 1 kHz mit −6 dB:
@@ -166,10 +200,12 @@ ein. Bei Übersteuerung begrenzt die Hardware sauber auf Vollaussteuerung (siehe
 | Parameter | Default | Bedeutung |
 |---|---|---|
 | `gain_permille` | 1000 | Startpegel |
-| `taps` | 0 | 1 = zwei Mitschnitt-Abgriffe (vor/hinter EQ) für Messungen anlegen |
+| `taps` | 0 | 1 = zwei Mitschnitt-Abgriffe (vor/hinter EQ) für Messungen anlegen. Nur für Messungen: diese Abgriffe hängen direkt am Decoder und lösen beim Wechsel von DD+-Passthrough auf PCM DSP-Abstürze aus |
+| `agc` | 1 | 0 = keine Werbe-Bremse (kein Abgriff); die Reparatur nach Passthrough läuft trotzdem |
 
 ## Grenzen
 
 - Nur PCM-Stereo vom Hauptdecoder. Passthrough und Mehrkanal-PCM laufen am EQ vorbei.
 - Koeffizienten sind für 48 kHz gerechnet (DVB). Bei 44,1 kHz verschieben sich Frequenzen um ~8 %.
-- Ungetestet: Standby/Aufwachen, Mediaplayer, Bild-in-Bild, Transcoding.
+- Getestet: Senderwechsel MPEG/AC3/DD+ (Passthrough) in beliebiger Reihenfolge, DSP-Watchdog-Neustarts.
+- Ungetestet: Aufwachen aus dem Standby mit Bild, Mediaplayer, Bild-in-Bild, Transcoding.

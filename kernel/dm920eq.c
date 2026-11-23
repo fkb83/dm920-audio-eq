@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
-/* dm920eq v3: BAPE hardware EQ in decoder0 -> outputs path, with measurement taps */
+/* dm920eq v4: BAPE hardware EQ in decoder0 -> outputs path, ad brake, measurement taps */
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/fs.h>
@@ -21,6 +21,9 @@ static int gain_permille = 1000;
 module_param(gain_permille, int, 0444);
 static int taps = 0;
 module_param(taps, int, 0444);
+static int agc = 1;
+module_param(agc, int, 0444);
+MODULE_PARM_DESC(agc, "0 = no ad-brake tap and thread");
 
 typedef int (*f_create3)(void *hApe, const void *s, void **out);
 typedef void (*f_getdef1)(void *s);
@@ -34,8 +37,10 @@ typedef int (*f_dec)(void *dec);
 typedef int (*f_cap_open)(void *hApe, unsigned idx, const void *s, void **out);
 typedef int (*f_cap_consume)(void *h, unsigned n);
 typedef int (*f_mix_vol)(void *mix, void *conn, void *vol);
+typedef void (*f_void)(void);
 
 static struct {
+	f_void b_lock, b_unlock;
 	f_mix_vol mix_getvol, mix_setvol;
 	f_create3 eq_create, st_create, mix_create; f_getdef1 eq_getdef, mix_getdef, mix_getdefs, cap_getdefs;
 	f_st_getdef st_getdef; f_setstages eq_setstages;
@@ -59,6 +64,18 @@ static const int cur_off[5] = { 0x0c, 0x1c, 0x2c, 0x4c, 0x3c };
 static const int mix_off[5] = { 0x10, 0x20, 0x30, 0x50, 0x40 };
 static const char *pname[5] = { "DUMMY", "DUMMY2", "DAC", "MAI(HDMI)", "SPDIF" };
 
+/*
+ * Locking. The driver runs its event handlers (audio DSP watchdog recovery, sample rate changes, ...)
+ * from b_event_task with its global b_lock held; the watchdog handler then takes the decoder mutexes.
+ * Decoder start/stop/format changes (ioctl path) run under the decoder mutex. Both tear down and
+ * rebuild mixer outputs, including our capture buffers (BAPE_OutputCapture_P_Disable frees the
+ * DFIFO group without any lock). Every BAPE call we make therefore runs with b_lock and then the
+ * decoder-0 mutex held - the same order the driver uses. Lock order in this module:
+ *     cfg_lock -> b_lock -> dec_mutex
+ */
+static void bape_lock(void)   { F.b_lock(); mutex_lock(dec_mutex); }
+static void bape_unlock(void) { mutex_unlock(dec_mutex); F.b_unlock(); }
+
 static int resolve(void)
 {
 	struct file *f;
@@ -78,6 +95,7 @@ static int resolve(void)
 	SYM(cap_getbuffer, "BAPE_OutputCapture_GetBuffer"); SYM(cap_consume, "BAPE_OutputCapture_ConsumeData");
 	SYM(dec_start, "bcm_audio_decoder_start"); SYM(dec_stop, "bcm_audio_decoder_stop");
 	SYM(mix_getvol, "BAPE_Mixer_GetInputVolume"); SYM(mix_setvol, "BAPE_Mixer_SetInputVolume");
+	SYM(b_lock, "b_lock"); SYM(b_unlock, "b_unlock");
 	f = filp_open("/proc/stb/audio/audio_delay_pcm", O_RDONLY, 0);
 	if (IS_ERR(f)) return PTR_ERR(f);
 	ctx = *(char **)((char *)PDE_DATA(file_inode(f)) + 0x24);
@@ -99,7 +117,9 @@ static int set_gain(int g)
 	mutex_lock(&cfg_lock);
 	*(u32 *)(stage_settings + 0x10) = 1;
 	*(s32 *)(stage_settings + 0x14) = ((1 << 26) / 1000) * g;
+	bape_lock();
 	ret = stage ? F.st_setsettings(stage, stage_settings) : 0;
+	bape_unlock();
 	if (!ret) gain_permille = g;
 	mutex_unlock(&cfg_lock);
 	pr_info("dm920eq: set gain %d ret=%d\n", g, ret);
@@ -124,9 +144,12 @@ static int cap_open_proc(struct inode *inode, struct file *file)
 	if (!tapcap[0] || !tapcap[1]) return -ENODEV;
 	s = vzalloc(sizeof(*s) + 2 * CAPMAX);
 	if (!s) return -ENOMEM;
+	bape_lock();
 	for (i = 0; i < 2; i++) { n[i] = cap_avail(i, &p[i]); if (n[i]) F.cap_consume(tapcap[i], n[i]); }
 	for (i = 0; i < 2; i++) { n[i] = cap_avail(i, &p[i]); if (n[i]) F.cap_consume(tapcap[i], n[i]); }
+	bape_unlock();
 	msleep(200);
+	bape_lock();
 	for (i = 0; i < 2; i++) {
 		F.cap_getbuffer(tapcap[i], d);
 		s->info[i][0] = d[0]; s->info[i][1] = *(u32 *)(d + 4); s->info[i][2] = *(u32 *)(d + 72); s->info[i][3] = *(u32 *)(d + 76);
@@ -137,6 +160,7 @@ static int cap_open_proc(struct inode *inode, struct file *file)
 		if (m && p[i]) memcpy(s->data + i * CAPMAX, p[i], m);
 		s->len[i] = m;
 	}
+	bape_unlock();
 	file->private_data = s;
 	return 0;
 }
@@ -182,7 +206,9 @@ static ssize_t bq_write(struct file *file, const char __user *buf, size_t cnt, l
 	memset(stage_settings + 0x14, 0, 8 * 20);
 	for (i = 0; i < 8; i++) *(s32 *)(stage_settings + 0x14 + i * 20) = 1 << 26;
 	memcpy(stage_settings + 0x14, c, 5 * n * 4);
+	bape_lock();
 	ret = F.st_setsettings(stage, stage_settings);
+	bape_unlock();
 	mutex_unlock(&cfg_lock);
 	pr_info("dm920eq: set %d biquads ret=%d\n", n, ret);
 	return ret ? -EIO : cnt;
@@ -199,15 +225,65 @@ static ssize_t status_read(struct file *file, char __user *buf, size_t cnt, loff
 	l += snprintf(tmp + l, sizeof(tmp) - l, "routing   %s\n", *(void **)(dev + 0xfc) == eqconn ? "driver-stereo=EQ" : "driver-stereo=raw");
 	return simple_read_from_buffer(buf, cnt, pos, tmp, l);
 }
-static const struct file_operations status_fops = { .owner = THIS_MODULE, .read = status_read, .llseek = default_llseek };
+static void agc_force_reapply(void);
+
+/*
+ * When the driver switches to compressed passthrough (DD+/DTS to HDMI) it removes our EQ connector
+ * from every output mixer; when it returns to PCM it adds it back. After that round trip the EQ chain
+ * no longer processes anything (output equals the unprocessed input: neither the filters nor the
+ * attenuator act) until the EQ input and outputs are re-added. relink(2) does exactly that; the
+ * worker thread calls it after every passthrough -> PCM transition. Bit 1 (re-add the decoder input
+ * of the pre mixer) is kept for diagnostics only.
+ * Called without b_lock (decoder stop/start), with the decoder mutex taken here.
+ */
+static int relink(int what)
+{
+	u8 ms[16]; int running, p, r1 = 0, r2 = 0, r3 = 0;
+	mutex_lock(dec_mutex);
+	running = *(u32 *)(dec + 0xf4);
+	if (running) F.dec_stop(dec);
+	if (what & 2)
+		for (p = 0; p < 5; p++)
+			if (*(void **)(dev + cur_off[p]) == eqconn) r3 |= F.mix_rm(*(void **)(dev + mix_off[p]), eqconn);
+	if (what & 1) {
+		r1 = F.mix_rm(pre, stereo);
+		F.mix_getdef(ms); ms[0] = 1;
+		r1 |= F.mix_add(pre, stereo, ms);
+	}
+	if (what & 2) {
+		r2 = F.eq_rminput(eq, preconn);
+		r2 |= F.eq_addinput(eq, preconn);
+		for (p = 0; p < 5; p++)
+			if (*(void **)(dev + cur_off[p]) == eqconn) { F.mix_getdef(ms); ms[0] = 1; r3 |= F.mix_add(*(void **)(dev + mix_off[p]), eqconn, ms); }
+	}
+	agc_force_reapply();
+	if (running) F.dec_start(dec);
+	mutex_unlock(dec_mutex);
+	pr_info("dm920eq: relink %d pre=%d eq=%d out=%d\n", what, r1, r2, r3);
+	return r1 | r2 | r3;
+}
+static ssize_t status_write(struct file *file, const char __user *buf, size_t cnt, loff_t *pos)
+{
+	char tmp[8]; int w;
+	if (cnt >= sizeof(tmp) || copy_from_user(tmp, buf, cnt)) return -EINVAL;
+	tmp[cnt] = 0;
+	if (kstrtoint(strim(tmp), 10, &w) || w < 1 || w > 3) return -EINVAL;
+	return relink(w) ? -EIO : cnt;
+}
+static const struct file_operations status_fops = { .owner = THIS_MODULE, .read = status_read, .write = status_write, .llseek = default_llseek };
 
 static const struct file_operations gain_fops = { .owner = THIS_MODULE, .read = gain_read, .write = gain_write, .llseek = default_llseek };
 
 /* ---------------------------------------------------------------------------------------------
  * Automatic level control ("Werbe-Bremse")
- * A third capture taps the raw decoder output. A kernel thread measures short-term loudness
- * (ITU-R BS.1770 K-weighting), tracks a slow programme reference and attenuates the input of
- * the intermediate mixer when the audio gets clearly louder than that reference.
+ * A capture is attached as an extra output of the driver's DAC mixer, i.e. behind the EQ and the
+ * attenuator. (An own mixer fed straight from the decoder would keep the decoder's PCM branch alive
+ * while the driver switches to DD+/DTS passthrough; the audio DSP then crashes in a loop when it
+ * returns to PCM decoding. The DAC mixer is idled by the driver itself in passthrough.)
+ * A kernel thread measures short-term loudness (ITU-R BS.1770 K-weighting), removes its own
+ * attenuation from the measurement, tracks a slow programme reference and attenuates the input of
+ * the intermediate mixer when the audio gets clearly louder than that reference. The EQ shifts
+ * measurement and reference alike, so it does not trigger the brake.
  * It only ever attenuates (gain <= 0 dB). All levels are in milli-dB (mdB).
  * ------------------------------------------------------------------------------------------- */
 #define AGC_CAP_INDEX   2
@@ -217,7 +293,7 @@ static const struct file_operations gain_fops = { .owner = THIS_MODULE, .read = 
 #define VOLSZ           264
 
 static struct task_struct *agc_task;
-static void *agcmix, *agccap, *agcport;
+static void *agcmix, *agccap, *agcport;   /* agcmix: the driver's DAC mixer, not ours */
 static u8 vol_base[VOLSZ];
 static int vol_base_ok;
 
@@ -231,9 +307,14 @@ static struct {
 	int loud, ref, gain;     /* mdB */
 	s64 ref_u;               /* reference in micro-dB */
 	int ref_valid, init_n, warmup; s64 init_acc;
-	int silent_blocks, was_running, applied_idx;
+	int silent_blocks, was_running, applied_idx, want_idx;
+	int meas;                /* last block as measured at the tap, before compensation (mdB) */
 	u32 loops, empty, bytes, blocks, maxchunk, dbg_d0, dbg_d4, dbg_wrap;
 } A = { .applied_idx = -1 };
+static void agc_force_reapply(void) { A.applied_idx = -1; }
+
+#define AGC_CHUNK (64 * 1024)
+static s32 agc_buf[AGC_CHUNK / 4];   /* private copy of captured audio, processed without locks */
 
 static const struct { int margin, ratio10, maxred; } agc_presets[4] = {
 	{ 0, 10, 0 }, { 4000, 20, 6000 }, { 3000, 30, 10000 }, { 2000, 50, 15000 },
@@ -247,14 +328,20 @@ static int mdb_from_energy(u64 e)   /* 10*log10(e) in mdB, e > 0 */
 	return (int)((l2 * 3010300LL) >> 16) / 1000;           /* * 10*log10(2) */
 }
 
+/* computes the wanted attenuation step (0.1 dB units); the AGC thread applies it under bape_lock */
 static void agc_apply_gain(int gain_mdb)
 {
-	u8 v[VOLSZ]; int idx, i; u32 g;
-	if (!vol_base_ok) return;
-	idx = (-gain_mdb + 50) / 100;
+	int idx = (-gain_mdb + 50) / 100;
 	if (idx < 0) idx = 0;
 	if (idx > 300) idx = 300;
-	if (idx == A.applied_idx) return;
+	ACCESS_ONCE(A.want_idx) = idx;
+}
+
+/* caller holds bape_lock */
+static void agc_set_volume_locked(int idx)
+{
+	u8 v[VOLSZ]; int i; u32 g;
+	if (!vol_base_ok || idx == A.applied_idx) return;
 	g = gain_q16[idx];
 	memcpy(v, vol_base, VOLSZ);
 	for (i = 0; i < 64; i++) {
@@ -276,6 +363,12 @@ static void agc_block(void)
 	int margin = A.margin, ratio10 = A.ratio10, maxred = A.maxred;
 
 	A.acc = 0; A.nacc = 0;
+	A.meas = ms ? mdb_from_energy(ms) - FS_OFFSET_MDB : -100000;
+	if (A.applied_idx > 0) {                                /* undo our own attenuation */
+		u32 g = gain_q16[A.applied_idx];
+		u64 inv = div64_u64(1ULL << 48, (u64)g * g);          /* 1/g^2 in Q16, <= 2^26 */
+		ms = ((ms >> 12) * inv) >> 4;
+	}
 	A.ms_short += ((s64)ms - A.ms_short) >> 3;               /* ~ 320 ms time constant */
 	A.loud = A.ms_short > 0 ? mdb_from_energy((u64)A.ms_short) - FS_OFFSET_MDB : -100000;
 
@@ -340,27 +433,56 @@ static void agc_process(const s32 *p, u32 frames)
 	}
 }
 
+static int eq_routed(void)   /* caller holds dec_mutex: is any real output fed by the EQ? */
+{
+	int p;
+	for (p = 2; p < 5; p++)
+		if (*(void **)(dev + cur_off[p]) == eqconn) return 1;
+	return 0;
+}
+
+static u32 relinks;
+
+/* worker: EQ chain repair after passthrough, and the ad brake (if its tap exists) */
 static int agc_thread(void *unused)
 {
+	int eq_was_on;
+	mutex_lock(dec_mutex); eq_was_on = eq_routed(); mutex_unlock(dec_mutex);
+
 	while (!kthread_should_stop()) {
-		u8 d[96]; int running = *(volatile u32 *)(dec + 0xf4);
-		if (running && !A.was_running) agc_reset_reference();   /* zap / restart */
-		A.was_running = running;
-		A.loops++;
+		u8 d[96]; u32 n = 0; int running, eq_on;
+
+		/* everything that touches driver objects happens under the driver's own locks, so a DSP
+		 * watchdog recovery or a decoder restart can never tear the capture down underneath us */
+		bape_lock();
+		running = *(volatile u32 *)(dec + 0xf4);
+		eq_on = eq_routed();
 		if (agccap && !F.cap_getbuffer(agccap, d)) {
 			const s32 *p = *(const s32 **)(d + 8);
-			u32 n = *(u32 *)(d + 72) & ~7u;
+			n = *(u32 *)(d + 72) & ~7u;
 			A.dbg_d0 = d[0]; A.dbg_d4 = *(u32 *)(d + 4); A.dbg_wrap = *(u32 *)(d + 76);
-			if (!n) A.empty++;
 			A.bytes += n; if (n > A.maxchunk) A.maxchunk = n;
-			if (n > 64 * 1024) n = 64 * 1024;
+			if (n > AGC_CHUNK) n = AGC_CHUNK;
 			if (n && p) {
-				mutex_lock(&cfg_lock);
-				agc_process(p, n / 8);
-				mutex_unlock(&cfg_lock);
+				memcpy(agc_buf, p, n);
 				F.cap_consume(agccap, n);
-			}
+			} else n = 0;
 		}
+		agc_set_volume_locked(ACCESS_ONCE(A.want_idx));
+		bape_unlock();
+
+		if (eq_on && !eq_was_on) {          /* back from passthrough: repair the EQ chain */
+			relink(2);
+			relinks++;
+		}
+		eq_was_on = eq_on;
+
+		mutex_lock(&cfg_lock);
+		A.loops++;
+		if (running && !A.was_running) agc_reset_reference();   /* zap / restart */
+		A.was_running = running;
+		if (n) agc_process(agc_buf, n / 8); else A.empty++;
+		mutex_unlock(&cfg_lock);
 		msleep_interruptible(30);
 	}
 	return 0;
@@ -375,6 +497,7 @@ static void agc_set_mode(int mode, int margin, int ratio10, int maxred)
 	A.mode = mode; A.margin = margin;
 	A.ratio10 = clamp(ratio10, 10, 200);
 	A.maxred = clamp(maxred, 0, 30000);
+	if (!A.mode) { A.gain = 0; agc_apply_gain(0); }   /* off: back to unity right away */
 	mutex_unlock(&cfg_lock);
 	pr_info("dm920eq: agc mode=%d margin=%d ratio=%d/10 maxred=%d\n", A.mode, A.margin, A.ratio10, A.maxred);
 }
@@ -394,37 +517,35 @@ static ssize_t agc_write(struct file *file, const char __user *buf, size_t cnt, 
 static ssize_t agc_read(struct file *file, char __user *buf, size_t cnt, loff_t *pos)
 {
 	char tmp[400];
-	int l = snprintf(tmp, sizeof(tmp), "mode %d\nloudness %d\nreference %d\ngain %d\nreference_valid %d\nactive %d\n"
-		"debug loops=%u empty=%u bytes=%u blocks=%u maxchunk=%u il=%u nbuf=%u wrap=%u\n",
-		A.mode, A.loud, A.ref, A.gain, A.ref_valid, agccap != NULL,
-		A.loops, A.empty, A.bytes, A.blocks, A.maxchunk, A.dbg_d0, A.dbg_d4, A.dbg_wrap);
+	int l = snprintf(tmp, sizeof(tmp), "mode %d\nloudness %d\nreference %d\ngain %d\nreference_valid %d\nactive %d\nmeasured %d\napplied %d\n"
+		"debug loops=%u empty=%u bytes=%u blocks=%u maxchunk=%u il=%u nbuf=%u wrap=%u relinks=%u\n",
+		A.mode, A.loud, A.ref, A.gain, A.ref_valid, agccap != NULL, A.meas, -100 * A.applied_idx,
+		A.loops, A.empty, A.bytes, A.blocks, A.maxchunk, A.dbg_d0, A.dbg_d4, A.dbg_wrap, relinks);
 	return simple_read_from_buffer(buf, cnt, pos, tmp, l);
 }
 static const struct file_operations agc_fops = { .owner = THIS_MODULE, .read = agc_read, .write = agc_write, .llseek = default_llseek };
 
 static void setup_agc(void)
 {
-	u8 mxs[256], ms[16], cs[32]; int ret;
+	u8 cs[32]; int ret;
 	if (F.mix_getvol(pre, stereo, vol_base) == 0) vol_base_ok = 1;
 	pr_info("dm920eq: base input volume %08x %08x %08x %08x muted=%d\n", ((u32 *)vol_base)[0], ((u32 *)vol_base)[1],
 		((u32 *)vol_base)[8], ((u32 *)vol_base)[9], vol_base[256]);
-	F.mix_getdefs(mxs);
-	if (F.mix_create(hApe, mxs, &agcmix)) { agcmix = NULL; return; }
-	F.mix_getdef(ms); ms[0] = 1;
-	F.mix_add(agcmix, stereo, ms);
+	agcmix = *(void **)(dev + mix_off[2]);                    /* DAC mixer */
+	if (!agcmix) { pr_err("dm920eq: no DAC mixer, no ad-brake tap\n"); return; }
 	F.cap_getdefs(cs);
 	ret = F.cap_open(hApe, AGC_CAP_INDEX, cs, &agccap);
-	if (ret) { pr_err("dm920eq: agc capture open ret=%d\n", ret); agccap = NULL; return; }
+	if (ret) { pr_err("dm920eq: agc capture open ret=%d\n", ret); agccap = NULL; agcmix = NULL; return; }
 	F.cap_getport(agccap, &agcport);
 	ret = F.mix_addout(agcmix, agcport);
+	if (ret) { pr_err("dm920eq: agc tap addout ret=%d\n", ret); F.cap_close(agccap); agccap = NULL; agcmix = NULL; return; }
 	pr_info("dm920eq: agc tap ready (addout ret=%d)\n", ret);
 }
 static void teardown_agc(void)
 {
 	if (!agcmix) return;
 	if (agccap) { F.mix_rmout(agcmix, agcport); F.cap_close(agccap); agccap = NULL; }
-	F.mix_rm(agcmix, stereo);
-	F.mix_destroy(agcmix); agcmix = NULL;
+	agcmix = NULL;
 	if (vol_base_ok) F.mix_setvol(pre, stereo, vol_base);
 }
 
@@ -473,6 +594,8 @@ static int __init eq_init(void)
 	ret = F.eq_addinput(eq, preconn); if (ret) goto err_pre;
 	F.eq_getconn(eq, &eqconn);
 
+	/* only the decoder mutex here (as the driver does around decoder stop/start); the AGC thread is
+	 * not running yet, and b_lock must not be held across bcm_audio_decoder_stop/start */
 	mutex_lock(dec_mutex);
 	running = *(u32 *)(dec + 0xf4);
 	if (running) F.dec_stop(dec);
@@ -492,7 +615,7 @@ static int __init eq_init(void)
 	/* let the driver route the EQ output wherever it would route plain stereo */
 	*(void **)(dev + 0xfc) = eqconn;
 	if (taps) setup_taps();
-	setup_agc();
+	if (agc) setup_agc();
 	if (running) F.dec_start(dec);
 	mutex_unlock(dec_mutex);
 
@@ -500,14 +623,12 @@ static int __init eq_init(void)
 	if (pdir) {
 		proc_create("gain", 0644, pdir, &gain_fops);
 		proc_create("biquads", 0200, pdir, &bq_fops);
-		proc_create("status", 0444, pdir, &status_fops);
+		proc_create("status", 0644, pdir, &status_fops);
 		proc_create("agc", 0644, pdir, &agc_fops);
 		if (taps) proc_create("capture", 0444, pdir, &cap_fops);
 	}
-	if (agccap) {
-		agc_task = kthread_run(agc_thread, NULL, "dm920eq-agc");
-		if (IS_ERR(agc_task)) agc_task = NULL;
-	}
+	agc_task = kthread_run(agc_thread, NULL, "dm920eq");
+	if (IS_ERR(agc_task)) agc_task = NULL;
 	pr_info("dm920eq: active, gain=%d/1000\n", gain_permille);
 	return 0;
 err_pre: F.mix_destroy(pre);
