@@ -27,6 +27,7 @@ config.plugins.hardwareeq.level = ConfigSelection(default="0", choices=LEVEL_CHO
 config.plugins.hardwareeq.protect = ConfigYesNo(default=False)
 config.plugins.hardwareeq.agc = ConfigSelection(default="0", choices=[
 	("0", "aus"), ("1", "leicht (bis -6 dB)"), ("2", "mittel (bis -10 dB)"), ("3", "stark (bis -15 dB)")])
+config.plugins.hardwareeq.radio_hdmi = ConfigYesNo(default=True)
 BANDS_CFG = []
 for _i in range(len(eqmath.BANDS)):
 	setattr(config.plugins.hardwareeq, "band%d" % _i, ConfigSelection(default="0", choices=GAIN_CHOICES))
@@ -89,6 +90,89 @@ def read_agc():
 
 def current_gains():
 	return [int(b.value) for b in BANDS_CFG]
+
+
+def set_preset(key):
+	"""Select a preset; copies its gains into the bands (except "custom")."""
+	cfg = config.plugins.hardwareeq
+	for k, name, gains in eqmath.PRESETS:
+		if k == key:
+			cfg.preset.value = k
+			if gains is not None:
+				for b, g in zip(BANDS_CFG, gains):
+					b.value = str(g)
+			return True
+	return False
+
+
+def save_settings():
+	cfg = config.plugins.hardwareeq
+	for item in [cfg.enabled, cfg.preset, cfg.level, cfg.protect, cfg.agc, cfg.radio_hdmi] + BANDS_CFG:
+		item.save()
+	cfg.save()
+	configfile.save()
+
+
+# ---- HDMI input (via the Newnigma2 "HDMI" plugin) ----
+
+def _nn2_hdmi():
+	import sys
+	for name, m in sys.modules.items():
+		if m is not None and name.endswith("newnigma2.hdmi.plugin") and hasattr(m, "HDMID"):
+			return m
+	try:
+		from Plugins.newnigma2.hdmi import plugin as m
+		return m
+	except Exception, e:
+		log("NN2 HDMI plugin not available: %s" % e)
+		return None
+
+
+def _hdmi_screen(session):
+	cands = [getattr(session, "current_dialog", None)]
+	for x in getattr(session, "dialog_stack", []):
+		cands.append(x[0] if isinstance(x, tuple) else x)
+	for d in cands:
+		if d is not None and d.__class__.__name__ == "HdmiMain":
+			return d
+	return None
+
+
+def hdmi_available():
+	return _nn2_hdmi() is not None
+
+
+def hdmi_active(session):
+	return _hdmi_screen(session) is not None
+
+
+def open_hdmi(session):
+	"""Start the HDMI input like Blue -> HDMI -> Play does. Returns True if it is (now) active."""
+	if _hdmi_screen(session) is not None:
+		return True
+	m = _nn2_hdmi()
+	if m is None:
+		return False
+	try:
+		m.HDMID(session)
+		return True
+	except Exception, e:
+		log("opening HDMI input failed: %s" % e)
+		return False
+
+
+def close_hdmi(session):
+	d = _hdmi_screen(session)
+	if d is None:
+		return True
+	if d is not getattr(session, "current_dialog", None):
+		return False            # something is open on top of it, leave it alone
+	try:
+		d.leave()
+		return True
+	except Exception, e:
+		log("closing HDMI input failed: %s" % e)
+		return False
 
 
 def apply_settings():
@@ -166,6 +250,8 @@ class HardwareEQSetup(ConfigListScreen, Screen):
 			getConfigListEntry("Gesamtpegel (zusätzlich leiser)", cfg.level),
 			getConfigListEntry("Übersteuerungsschutz", cfg.protect),
 		]
+		if hdmi_available():
+			lst.append(getConfigListEntry("Radio-Taste schaltet auf HDMI-Eingang", cfg.radio_hdmi))
 		for label, band in zip(eqmath.BAND_LABELS, BANDS_CFG):
 			lst.append(getConfigListEntry("Band %s" % label, band))
 		self["config"].list = lst
@@ -200,8 +286,11 @@ class HardwareEQSetup(ConfigListScreen, Screen):
 			preamp, boost = res
 			status = read_status()
 			names = {"MAI(HDMI)": "HDMI", "SPDIF": "S/PDIF", "DAC": "DAC"}
-			outs = [names.get(l.split()[0], l.split()[0]) for l in status.splitlines() if l.endswith(" EQ")]
+			lines = status.splitlines()
+			outs = [names[l.split()[0]] for l in lines if l.endswith(" EQ") and l.split()[0] in names]
 			where = ", ".join(outs) if outs else "keinem Ausgang (Passthrough/Mehrkanal?)"
+			if any(l.startswith("hdmi-in") and l.endswith(" EQ") for l in lines):
+				where += " (auch für den HDMI-Eingang)"
 			if boost > 0.05 and not cfg.protect.value:
 				txt = "EQ aktiv auf %s. Anhebung bis %+.1f dB" % (where, boost)
 			elif preamp < -0.05:
@@ -245,10 +334,7 @@ class HardwareEQSetup(ConfigListScreen, Screen):
 		self.update()
 
 	def save(self):
-		for x in self["config"].list:
-			x[1].save()
-		config.plugins.hardwareeq.save()
-		configfile.save()
+		save_settings()
 		self.close()
 
 	def cancel(self):
@@ -262,17 +348,47 @@ def main(session, **kwargs):
 	session.open(HardwareEQSetup)
 
 
+_orig_showRadio = None
+
+
+def _show_radio(self):
+	if config.plugins.hardwareeq.radio_hdmi.value and open_hdmi(self.session):
+		return
+	_orig_showRadio(self)
+
+
+def autostart(reason, **kwargs):
+	"""Radio button -> HDMI input. Patched before the InfoBar is created."""
+	global _orig_showRadio
+	if reason != 0 or _orig_showRadio is not None:
+		return
+	try:
+		from Screens.InfoBar import InfoBar
+		_orig_showRadio = InfoBar.showRadio
+		InfoBar.showRadio = _show_radio
+	except Exception, e:
+		log("radio button hook failed: %s" % e)
+
+
 def sessionstart(reason, **kwargs):
+	if reason != 0:
+		return
 	cfg = config.plugins.hardwareeq
-	if reason == 0 and (cfg.enabled.value or cfg.agc.value != "0"):
+	if cfg.enabled.value or cfg.agc.value != "0":
 		try:
 			apply_settings()
 		except Exception, e:
 			log("autostart failed: %s" % e)
+	try:
+		import webui
+		webui.register(kwargs["session"])
+	except Exception, e:
+		log("web interface not available: %s" % e)
 
 
 def Plugins(**kwargs):
 	return [
+		PluginDescriptor(where=PluginDescriptor.WHERE_AUTOSTART, fnc=autostart),
 		PluginDescriptor(where=PluginDescriptor.WHERE_SESSIONSTART, fnc=sessionstart),
 		PluginDescriptor(name="Hardware-Equalizer", description="Klangregelung und Werbe-Bremse für HDMI- und S/PDIF-Ton",
 			where=[PluginDescriptor.WHERE_PLUGINMENU, PluginDescriptor.WHERE_EXTENSIONSMENU], fnc=main),

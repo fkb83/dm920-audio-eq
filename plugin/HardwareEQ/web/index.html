@@ -1,0 +1,304 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Klang">
+<meta name="theme-color" content="#0f1115">
+<link rel="apple-touch-icon" href="static/icon.png">
+<title>Klang</title>
+<style>
+:root{
+  --bg:#0f1115; --card:#181b22; --line:#262a33; --text:#e9ecf1; --mute:#8c93a1;
+  --acc:#4da3ff; --acc2:#7dd3a8; --warn:#ffb547; --danger:#ff6b6b;
+}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;background:var(--bg);color:var(--text);
+  font:16px/1.35 -apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",Roboto,sans-serif}
+body{padding:calc(env(safe-area-inset-top) + 12px) 16px calc(env(safe-area-inset-bottom) + 24px);
+  max-width:560px;margin:0 auto;-webkit-user-select:none;user-select:none}
+header{display:flex;align-items:center;justify-content:space-between;margin:4px 2px 14px}
+h1{font-size:28px;margin:0;font-weight:700;letter-spacing:-.02em}
+.pill{font-size:13px;color:var(--mute);background:var(--card);border:1px solid var(--line);
+  border-radius:999px;padding:5px 10px;white-space:nowrap}
+.pill.ok{color:var(--acc2)} .pill.err{color:var(--danger)}
+.card{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:16px;margin-bottom:14px}
+.row{display:flex;align-items:center;justify-content:space-between;gap:12px}
+.title{font-size:17px;font-weight:600}
+.sub{font-size:13px;color:var(--mute);margin-top:2px}
+.seg{display:flex;background:#10131a;border:1px solid var(--line);border-radius:12px;padding:3px;gap:3px}
+.seg button{flex:1;border:0;background:transparent;color:var(--mute);font:inherit;font-size:15px;
+  padding:10px 4px;border-radius:9px;min-height:44px}
+.seg button.on{background:#2a3242;color:var(--text);font-weight:600}
+.switch{position:relative;width:52px;height:32px;flex:none}
+.switch input{opacity:0;width:0;height:0}
+.switch span{position:absolute;inset:0;background:#3a3f4a;border-radius:999px;transition:.2s}
+.switch span:before{content:"";position:absolute;left:3px;top:3px;width:26px;height:26px;border-radius:50%;
+  background:#fff;transition:.2s}
+.switch input:checked+span{background:var(--acc2)}
+.switch input:checked+span:before{transform:translateX(20px)}
+canvas{width:100%;height:150px;display:block;margin:12px 0 6px;border-radius:12px;background:#10131a}
+.chips{display:flex;gap:8px;overflow-x:auto;padding:4px 0 10px;scrollbar-width:none}
+.chips::-webkit-scrollbar{display:none}
+.chip{flex:none;border:1px solid var(--line);background:#10131a;color:var(--text);font:inherit;font-size:14px;
+  padding:9px 14px;border-radius:999px;min-height:40px}
+.chip.on{border-color:var(--acc);color:var(--acc);font-weight:600}
+.band{display:grid;grid-template-columns:62px 1fr 56px;align-items:center;gap:10px;min-height:46px}
+.band label{font-size:14px;color:var(--mute)}
+.band output{text-align:right;font-variant-numeric:tabular-nums;font-size:15px}
+input[type=range]{-webkit-appearance:none;appearance:none;width:100%;height:36px;background:transparent;margin:0}
+input[type=range]::-webkit-slider-runnable-track{height:6px;border-radius:3px;background:var(--track,#2c313c)}
+input[type=range]::-moz-range-track{height:6px;border-radius:3px;background:#2c313c}
+input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:28px;height:28px;border-radius:50%;
+  background:#fff;margin-top:-11px;box-shadow:0 1px 4px rgba(0,0,0,.5)}
+input[type=range]::-moz-range-thumb{width:28px;height:28px;border-radius:50%;background:#fff;border:0}
+.btn{border:1px solid var(--line);background:#10131a;color:var(--text);font:inherit;font-size:15px;
+  border-radius:12px;padding:10px 14px;min-height:44px}
+.meter{height:12px;background:#10131a;border:1px solid var(--line);border-radius:999px;overflow:hidden;margin:12px 0 6px}
+.meter div{height:100%;width:0;background:linear-gradient(90deg,var(--warn),var(--danger));transition:width .4s}
+.stats{display:flex;justify-content:space-between;font-size:13px;color:var(--mute);font-variant-numeric:tabular-nums}
+.dim{opacity:.45;pointer-events:none}
+.hint{font-size:13px;color:var(--mute);margin-top:10px}
+.toast{position:fixed;left:50%;bottom:calc(env(safe-area-inset-bottom) + 18px);transform:translateX(-50%);
+  background:#2a3242;color:var(--text);padding:10px 16px;border-radius:12px;font-size:14px;opacity:0;transition:.25s}
+.toast.show{opacity:1}
+</style>
+</head>
+<body>
+<header>
+  <h1>Klang</h1>
+  <span class="pill" id="status">verbinde …</span>
+</header>
+
+<section class="card" id="srcCard">
+  <div class="title" style="margin-bottom:10px">Quelle</div>
+  <div class="seg" id="source">
+    <button data-v="tv">Fernsehen</button>
+    <button data-v="hdmi">HDMI-Eingang</button>
+  </div>
+</section>
+
+<section class="card">
+  <div class="row">
+    <div><div class="title">Equalizer</div><div class="sub" id="eqsub">–</div></div>
+    <label class="switch"><input type="checkbox" id="enabled"><span></span></label>
+  </div>
+  <div id="eqbody">
+    <canvas id="curve" width="1000" height="300"></canvas>
+    <div class="chips" id="presets"></div>
+    <div id="bands"></div>
+    <div class="row" style="margin-top:10px">
+      <span class="sub">Ziehen = sofort hörbar, wird automatisch gespeichert</span>
+      <button class="btn" id="flat">Neutral</button>
+    </div>
+  </div>
+</section>
+
+<section class="card">
+  <div class="title">Pegel</div>
+  <div class="band" style="margin-top:6px">
+    <label>Gesamt</label>
+    <input type="range" id="level" min="-12" max="0" step="1">
+    <output id="levelv">0 dB</output>
+  </div>
+  <div class="row" style="margin-top:6px">
+    <div><div>Übersteuerungsschutz</div><div class="sub">senkt beim Anheben den Rest ab</div></div>
+    <label class="switch"><input type="checkbox" id="protect"><span></span></label>
+  </div>
+</section>
+
+<section class="card">
+  <div class="title" style="margin-bottom:10px">Werbe-Bremse</div>
+  <div class="seg" id="agc">
+    <button data-v="0">Aus</button><button data-v="1">Leicht</button>
+    <button data-v="2">Mittel</button><button data-v="3">Stark</button>
+  </div>
+  <div id="agclive">
+    <div class="meter"><div id="agcbar"></div></div>
+    <div class="stats"><span id="agctxt">–</span><span id="agcvals"></span></div>
+  </div>
+</section>
+
+<section class="card" id="radioCard">
+  <div class="row">
+    <div><div>Radio-Taste</div><div class="sub">schaltet auf den HDMI-Eingang</div></div>
+    <label class="switch"><input type="checkbox" id="radio_hdmi"><span></span></label>
+  </div>
+</section>
+
+<div class="toast" id="toast"></div>
+
+<script>
+"use strict";
+const API = "api";
+const $ = (id) => document.getElementById(id);
+let S = null;                 // last state from the box
+let busyUntil = 0;            // don't overwrite controls while the user is interacting
+let sendTimer = null, pending = {};
+
+function toast(msg) {
+  const t = $("toast"); t.textContent = msg; t.classList.add("show");
+  clearTimeout(toast.h); toast.h = setTimeout(() => t.classList.remove("show"), 1800);
+}
+function fmt(v) { return (v > 0 ? "+" : "") + v + " dB"; }
+
+async function call(path, body) {
+  const r = await fetch(path, body === undefined ? {cache: "no-store"} :
+    {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
+  const j = await r.json();
+  if (!r.ok) throw new Error(j.error || r.status);
+  return j;
+}
+
+// ---- sending: live updates are throttled, the final value is saved ----
+function send(obj, save) {
+  Object.assign(pending, obj);
+  busyUntil = Date.now() + 2500;
+  if (save) { flush(true); return; }
+  if (!sendTimer) sendTimer = setTimeout(() => flush(false), 120);
+}
+async function flush(save) {
+  clearTimeout(sendTimer); sendTimer = null;
+  const body = Object.assign({}, pending, save ? {save: true} : {});
+  pending = {};
+  try { const st = await call(API, body); if (save) { S = st; render(true); } setOnline(true); }
+  catch (e) { setOnline(false, e.message); }
+}
+
+// ---- filter maths (same RBJ formulas as the box) for the curve ----
+const FS = 48000;
+function rbj(kind, f, g, q) {
+  const A = Math.pow(10, g / 40), w = 2 * Math.PI * f / FS, c = Math.cos(w), s = Math.sin(w), al = s / (2 * q);
+  let b, a;
+  if (kind === "peak") { b = [1 + al * A, -2 * c, 1 - al * A]; a = [1 + al / A, -2 * c, 1 - al / A]; }
+  else { const sq = 2 * Math.sqrt(A) * al;
+    if (kind === "lowshelf") {
+      b = [A * ((A + 1) - (A - 1) * c + sq), 2 * A * ((A - 1) - (A + 1) * c), A * ((A + 1) - (A - 1) * c - sq)];
+      a = [(A + 1) + (A - 1) * c + sq, -2 * ((A - 1) + (A + 1) * c), (A + 1) + (A - 1) * c - sq];
+    } else {
+      b = [A * ((A + 1) + (A - 1) * c + sq), -2 * A * ((A - 1) + (A + 1) * c), A * ((A + 1) + (A - 1) * c - sq)];
+      a = [(A + 1) - (A - 1) * c + sq, 2 * ((A - 1) - (A + 1) * c), (A + 1) - (A - 1) * c - sq];
+    } }
+  return [b[0] / a[0], b[1] / a[0], b[2] / a[0], a[1] / a[0], a[2] / a[0]];
+}
+function magDb(coefs, f) {
+  const w = 2 * Math.PI * f / FS; let db = 0;
+  for (const [b0, b1, b2, a1, a2] of coefs) {
+    const cr = Math.cos(w), ci = -Math.sin(w), c2r = Math.cos(2 * w), c2i = -Math.sin(2 * w);
+    const nr = b0 + b1 * cr + b2 * c2r, ni = b1 * ci + b2 * c2i;
+    const dr = 1 + a1 * cr + a2 * c2r, di = a1 * ci + a2 * c2i;
+    db += 10 * Math.log10((nr * nr + ni * ni) / (dr * dr + di * di));
+  }
+  return db;
+}
+function drawCurve() {
+  const cv = $("curve"), ctx = cv.getContext("2d"), W = cv.width, H = cv.height;
+  ctx.clearRect(0, 0, W, H);
+  const fx = (f) => Math.log(f / 20) / Math.log(1000) * W, gy = (g) => H / 2 - g / 15 * (H / 2 - 12);
+  ctx.strokeStyle = "#232834"; ctx.lineWidth = 2; ctx.fillStyle = "#596173"; ctx.font = "22px -apple-system,sans-serif";
+  for (const f of [50, 100, 200, 500, 1000, 2000, 5000, 10000]) {
+    ctx.beginPath(); ctx.moveTo(fx(f), 0); ctx.lineTo(fx(f), H); ctx.stroke();
+    ctx.fillText(f >= 1000 ? f / 1000 + "k" : f, fx(f) + 4, H - 8);
+  }
+  for (const g of [-12, -6, 6, 12]) { ctx.beginPath(); ctx.moveTo(0, gy(g)); ctx.lineTo(W, gy(g)); ctx.stroke(); }
+  ctx.strokeStyle = "#3a4152"; ctx.beginPath(); ctx.moveTo(0, gy(0)); ctx.lineTo(W, gy(0)); ctx.stroke();
+  if (!S) return;
+  const gains = bandValues();
+  const coefs = S.band_defs.map(([k, f, q], i) => gains[i] ? rbj(k, f, gains[i], q) : null).filter(Boolean);
+  const level = +$("level").value;
+  let pts = [], peak = -99;
+  for (let i = 0; i <= 240; i++) { const f = 20 * Math.pow(1000, i / 240); const g = magDb(coefs, f); peak = Math.max(peak, g); pts.push([f, g]); }
+  const off = level + ($("protect").checked && peak > 0 ? -peak : 0);
+  const on = $("enabled").checked;
+  const grad = ctx.createLinearGradient(0, 0, 0, H);
+  grad.addColorStop(0, on ? "rgba(77,163,255,.35)" : "rgba(140,147,161,.2)"); grad.addColorStop(1, "rgba(77,163,255,0)");
+  ctx.beginPath(); pts.forEach(([f, g], i) => { const x = fx(f), y = gy(g + off); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
+  ctx.lineTo(W, gy(0)); ctx.lineTo(0, gy(0)); ctx.closePath(); ctx.fillStyle = grad; ctx.fill();
+  ctx.beginPath(); pts.forEach(([f, g], i) => { const x = fx(f), y = gy(g + off); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
+  ctx.strokeStyle = on ? "#4da3ff" : "#8c93a1"; ctx.lineWidth = 5; ctx.stroke();
+}
+
+// ---- UI ----
+function bandValues() { return [...document.querySelectorAll("#bands input")].map((x) => +x.value); }
+function paintTrack(inp) {
+  const min = +inp.min, max = +inp.max, v = +inp.value, mid = (0 - min) / (max - min) * 100, p = (v - min) / (max - min) * 100;
+  const a = Math.min(mid, p), b = Math.max(mid, p);
+  inp.style.setProperty("--track", `linear-gradient(90deg,#2c313c ${a}%,#4da3ff ${a}%,#4da3ff ${b}%,#2c313c ${b}%)`);
+}
+function build() {
+  const bands = $("bands"); bands.innerHTML = "";
+  S.band_labels.forEach((lab, i) => {
+    const row = document.createElement("div"); row.className = "band";
+    row.innerHTML = `<label>${lab}</label><input type="range" min="${S.gain_range[0]}" max="${S.gain_range[1]}" step="1"><output></output>`;
+    const inp = row.querySelector("input"), out = row.querySelector("output");
+    inp.addEventListener("input", () => { out.textContent = fmt(+inp.value); paintTrack(inp); markPreset("custom"); drawCurve(); send({bands: bandValues()}); });
+    inp.addEventListener("change", () => send({bands: bandValues()}, true));
+    bands.appendChild(row);
+  });
+  const pr = $("presets"); pr.innerHTML = "";
+  S.presets.filter((p) => p[2]).forEach(([k, n]) => {
+    const b = document.createElement("button"); b.className = "chip"; b.dataset.v = k; b.textContent = n.replace(/ \(.*\)/, "");
+    b.onclick = () => { markPreset(k); send({preset: k}, true); };
+    pr.appendChild(b);
+  });
+  built = true;
+}
+let built = false;
+function markPreset(k) { document.querySelectorAll("#presets .chip").forEach((c) => c.classList.toggle("on", c.dataset.v === k)); }
+function setSeg(id, v) { document.querySelectorAll(`#${id} button`).forEach((b) => b.classList.toggle("on", b.dataset.v === String(v))); }
+
+function render(force) {
+  if (!S) return;
+  if (!built) build();
+  const live = force || Date.now() > busyUntil;
+  if (live) {
+    $("enabled").checked = S.enabled; $("protect").checked = S.protect; $("radio_hdmi").checked = S.radio_hdmi;
+    $("level").value = S.level; $("levelv").textContent = S.level + " dB"; paintTrack($("level"));
+    document.querySelectorAll("#bands input").forEach((inp, i) => {
+      inp.value = S.bands[i]; inp.nextElementSibling.textContent = fmt(S.bands[i]); paintTrack(inp);
+    });
+    markPreset(S.preset); setSeg("agc", S.agc); drawCurve();
+  }
+  setSeg("source", S.source);
+  $("srcCard").style.display = S.hdmi_available ? "" : "none";
+  $("radioCard").style.display = S.hdmi_available ? "" : "none";
+  $("eqbody").classList.toggle("dim", !S.enabled);
+  $("eqsub").textContent = !S.module ? "Treibermodul nicht geladen" :
+    !S.enabled ? "aus" : S.outputs.length ? "aktiv auf " + S.outputs.join(", ") : "kein PCM-Ausgang (Passthrough?)";
+  const a = S.agc_live, on = S.agc > 0;
+  $("agclive").classList.toggle("dim", !on);
+  $("agcbar").style.width = on ? Math.min(100, -a.gain / 15 * 100) + "%" : "0";
+  $("agctxt").textContent = !on ? "aus" : !a.valid ? "lernt den Programmpegel …" :
+    a.gain <= -0.5 ? `senkt ab: ${a.gain.toFixed(1)} dB` : "bereit, keine Absenkung";
+  $("agcvals").textContent = on && a.valid ? `Lautheit ${a.loudness.toFixed(0)} · Bezug ${a.reference.toFixed(0)} LUFS` : "";
+}
+function setOnline(ok, msg) {
+  const p = $("status");
+  if (!ok) { p.textContent = "keine Verbindung"; p.className = "pill err"; if (msg) toast(msg); return; }
+  p.textContent = S ? (S.source === "hdmi" ? "HDMI-Eingang" : "Fernsehen") : "verbunden"; p.className = "pill ok";
+}
+
+$("enabled").onchange = (e) => { send({enabled: e.target.checked}, true); render(true); };
+$("protect").onchange = (e) => { drawCurve(); send({protect: e.target.checked}, true); };
+$("radio_hdmi").onchange = (e) => send({radio_hdmi: e.target.checked}, true);
+$("level").oninput = (e) => { $("levelv").textContent = e.target.value + " dB"; paintTrack(e.target); drawCurve(); send({level: +e.target.value}); };
+$("level").onchange = (e) => send({level: +e.target.value}, true);
+$("flat").onclick = () => { markPreset("flat"); send({preset: "flat"}, true); };
+document.querySelectorAll("#agc button").forEach((b) => b.onclick = () => { setSeg("agc", b.dataset.v); send({agc: +b.dataset.v}, true); });
+document.querySelectorAll("#source button").forEach((b) => b.onclick = async () => {
+  setSeg("source", b.dataset.v);
+  try { S = await call(API + "/source", {source: b.dataset.v}); render(true); setOnline(true); toast(b.dataset.v === "hdmi" ? "HDMI-Eingang" : "Fernsehen"); }
+  catch (e) { toast(e.message); poll(); }
+});
+
+async function poll() {
+  try { S = await call(API); render(false); setOnline(true); } catch (e) { setOnline(false); }
+}
+poll(); setInterval(() => { if (!document.hidden) poll(); }, 1500);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) poll(); });
+</script>
+</body>
+</html>

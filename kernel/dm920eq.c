@@ -41,6 +41,7 @@ typedef void (*f_void)(void);
 
 static struct {
 	f_void b_lock, b_unlock;
+	f_h_ptr bdec_start; f_destroy bdec_stop;
 	f_mix_vol mix_getvol, mix_setvol;
 	f_create3 eq_create, st_create, mix_create; f_getdef1 eq_getdef, mix_getdef, mix_getdefs, cap_getdefs;
 	f_st_getdef st_getdef; f_setstages eq_setstages;
@@ -54,6 +55,18 @@ static struct {
 static char *ctx, *dev, *dec;
 static struct mutex *dec_mutex;
 static void *hApe, *eq, *stage, *eqconn, *stereo, *pre, *preconn;
+/* HDMI input ("hdmi-rx"): the driver plays it on its decoder 1. Stereo connector at dev+0x29c,
+ * BAPE decoder handle at dev+0x294, its start settings at dev+0x300, decoder-1 mutex at dev+0x400
+ * (see bcm_audio_mai_input_format_changed_event). hdmiin=1 feeds it through the same EQ chain. */
+static int hdmiin = 1;
+module_param(hdmiin, int, 0444);
+#define HDMI_CONN_OFF 0x29c
+#define HDMI_DEC_OFF  0x294
+#define HDMI_SET_OFF  0x300
+#define HDMI_MTX_OFF  0x400
+#define BDEC_STATE    0x3e4             /* BAPE decoder state, 0 = stopped */
+static void *hstereo; static int hdmi_linked; static struct mutex *dec1_mutex;
+static u8 hvol_base[264]; static int hvol_base_ok;
 static void *tapmix[2], *tapcap[2], *tapport[2];
 static int ports_done[5];
 static DEFINE_MUTEX(cfg_lock);
@@ -96,6 +109,7 @@ static int resolve(void)
 	SYM(dec_start, "bcm_audio_decoder_start"); SYM(dec_stop, "bcm_audio_decoder_stop");
 	SYM(mix_getvol, "BAPE_Mixer_GetInputVolume"); SYM(mix_setvol, "BAPE_Mixer_SetInputVolume");
 	SYM(b_lock, "b_lock"); SYM(b_unlock, "b_unlock");
+	SYM(bdec_start, "BAPE_Decoder_Start"); SYM(bdec_stop, "BAPE_Decoder_Stop");
 	f = filp_open("/proc/stb/audio/audio_delay_pcm", O_RDONLY, 0);
 	if (IS_ERR(f)) return PTR_ERR(f);
 	ctx = *(char **)((char *)PDE_DATA(file_inode(f)) + 0x24);
@@ -220,55 +234,93 @@ static ssize_t status_read(struct file *file, char __user *buf, size_t cnt, loff
 	char tmp[512]; int l = 0, p;
 	for (p = 0; p < 5; p++) {
 		void *c = *(void **)(dev + cur_off[p]);
-		l += snprintf(tmp + l, sizeof(tmp) - l, "%-10s %s\n", pname[p], c == eqconn ? "EQ" : c == stereo ? "stereo (bypass!)" : c ? "other" : "none");
+		l += snprintf(tmp + l, sizeof(tmp) - l, "%-10s %s\n", pname[p], c == eqconn ? "EQ" : c == stereo ? "stereo (bypass!)" :
+			c && c == hstereo ? (p < 2 ? "hdmi-in (internal)" : "hdmi-in (bypass!)") : c ? "other" : "none");
 	}
 	l += snprintf(tmp + l, sizeof(tmp) - l, "routing   %s\n", *(void **)(dev + 0xfc) == eqconn ? "driver-stereo=EQ" : "driver-stereo=raw");
+	l += snprintf(tmp + l, sizeof(tmp) - l, "hdmi-in   %s\n", hdmi_linked ? "EQ" : "not linked");
 	return simple_read_from_buffer(buf, cnt, pos, tmp, l);
 }
 static void agc_force_reapply(void);
 
-/*
- * When the driver switches to compressed passthrough (DD+/DTS to HDMI) it removes our EQ connector
- * from every output mixer; when it returns to PCM it adds it back. After that round trip the EQ chain
- * no longer processes anything (output equals the unprocessed input: neither the filters nor the
- * attenuator act) until the EQ input and outputs are re-added. relink(2) does exactly that; the
- * worker thread calls it after every passthrough -> PCM transition. Bit 1 (re-add the decoder input
- * of the pre mixer) is kept for diagnostics only.
- * Called without b_lock (decoder stop/start), with the decoder mutex taken here.
- */
-static int relink(int what)
+static int hdmi_dec_busy(void)
 {
-	u8 ms[16]; int running, p, r1 = 0, r2 = 0, r3 = 0;
-	mutex_lock(dec_mutex);
-	running = *(u32 *)(dec + 0xf4);
-	if (running) F.dec_stop(dec);
-	if (what & 2)
-		for (p = 0; p < 5; p++)
-			if (*(void **)(dev + cur_off[p]) == eqconn) r3 |= F.mix_rm(*(void **)(dev + mix_off[p]), eqconn);
-	if (what & 1) {
-		r1 = F.mix_rm(pre, stereo);
-		F.mix_getdef(ms); ms[0] = 1;
-		r1 |= F.mix_add(pre, stereo, ms);
+	char *h = *(char **)(dev + HDMI_DEC_OFF);
+	return !h || *(u32 *)(h + BDEC_STATE) != 0;
+}
+static int hdmi_running(void) { return hdmi_linked && hdmi_dec_busy(); }
+
+/* connect the HDMI-input decoder to the pre mixer. Caller holds the decoder mutexes and has made sure
+ * that neither decoder plays and no output uses the HDMI connector (init: checked here). */
+static void link_hdmi(int checked)
+{
+	u8 ms[16]; int p, busy = 0;
+	if (hdmi_linked || !hstereo || hstereo == stereo) return;
+	if (!checked) {
+		busy = hdmi_dec_busy();
+		for (p = 2; p < 5; p++) if (*(void **)(dev + cur_off[p]) == hstereo) busy = 1;   /* DUMMY keeps it */
 	}
-	if (what & 2) {
-		r2 = F.eq_rminput(eq, preconn);
-		r2 |= F.eq_addinput(eq, preconn);
-		for (p = 0; p < 5; p++)
-			if (*(void **)(dev + cur_off[p]) == eqconn) { F.mix_getdef(ms); ms[0] = 1; r3 |= F.mix_add(*(void **)(dev + mix_off[p]), eqconn, ms); }
+	if (!busy) {
+		F.mix_getdef(ms); ms[0] = 1;
+		if (!F.mix_add(pre, hstereo, ms)) {
+			hdmi_linked = 1;
+			hvol_base_ok = F.mix_getvol(pre, hstereo, hvol_base) == 0;
+		}
+	}
+	pr_info("dm920eq: hdmi input %s\n", hdmi_linked ? "through EQ" : busy ? "busy, linked later" : "not linked");
+}
+
+/*
+ * The BAPE equalizer only processes for the consumers it had when its input was attached. When the
+ * driver removes our EQ connector from an output mixer and adds it again (DD+/DTS passthrough and
+ * back), or puts the raw HDMI-input connector there, that output gets unprocessed audio (measured).
+ * rebuild() stops whatever plays (TV decoder, HDMI-input decoder - like the driver does on a format
+ * change), points every PCM output at the EQ, re-attaches the EQ input and restarts.
+ * Called without b_lock (decoder stop/start), takes the decoder mutexes in the driver's order.
+ */
+static int rebuild(void)
+{
+	u8 ms[16]; int p, r = 0, tv_run, hd_run = 0, mask = 0, use_hdmi = hdmiin && hstereo && hstereo != stereo;
+	void *hdec = *(void **)(dev + HDMI_DEC_OFF);
+	mutex_lock(dec_mutex);
+	if (use_hdmi) mutex_lock(dec1_mutex);
+	tv_run = *(u32 *)(dec + 0xf4);
+	if (use_hdmi) hd_run = hdmi_dec_busy() && hdec;
+	if (tv_run) F.dec_stop(dec);
+	if (hd_run) F.bdec_stop(hdec);
+	for (p = 2; p < 5; p++) {
+		void *c = *(void **)(dev + cur_off[p]);
+		if (!c || (c != eqconn && c != stereo && !(use_hdmi && c == hstereo))) continue;
+		if (F.mix_rm(*(void **)(dev + mix_off[p]), c)) r |= 1;
+		mask |= 1 << p;
+	}
+	if (use_hdmi) link_hdmi(1);           /* both decoders stopped, no output on the HDMI connector */
+	if (F.eq_rminput(eq, preconn)) r |= 2;
+	else if (F.eq_addinput(eq, preconn)) r |= 4;
+	for (p = 2; p < 5; p++) {
+		if (!(mask & (1 << p))) continue;
+		F.mix_getdef(ms); ms[0] = 1;
+		if (F.mix_add(*(void **)(dev + mix_off[p]), eqconn, ms)) {
+			r |= 8;
+			*(void **)(dev + cur_off[p]) = NULL;   /* nothing connected: the driver will add afresh */
+		} else
+			*(void **)(dev + cur_off[p]) = eqconn;
 	}
 	agc_force_reapply();
-	if (running) F.dec_start(dec);
+	if (hd_run) F.bdec_start(hdec, dev + HDMI_SET_OFF);
+	if (tv_run) F.dec_start(dec);
+	if (use_hdmi) mutex_unlock(dec1_mutex);
 	mutex_unlock(dec_mutex);
-	pr_info("dm920eq: relink %d pre=%d eq=%d out=%d\n", what, r1, r2, r3);
-	return r1 | r2 | r3;
+	pr_info("dm920eq: rebuild outputs=%x tv=%d hdmi=%d ret=%d\n", mask, tv_run, hd_run, r);
+	return r;
 }
 static ssize_t status_write(struct file *file, const char __user *buf, size_t cnt, loff_t *pos)
 {
 	char tmp[8]; int w;
 	if (cnt >= sizeof(tmp) || copy_from_user(tmp, buf, cnt)) return -EINVAL;
 	tmp[cnt] = 0;
-	if (kstrtoint(strim(tmp), 10, &w) || w < 1 || w > 3) return -EINVAL;
-	return relink(w) ? -EIO : cnt;
+	if (kstrtoint(strim(tmp), 10, &w) || w != 1) return -EINVAL;   /* 1 = rebuild (diagnostics) */
+	return rebuild() ? -EIO : cnt;
 }
 static const struct file_operations status_fops = { .owner = THIS_MODULE, .read = status_read, .write = status_write, .llseek = default_llseek };
 
@@ -309,6 +361,7 @@ static struct {
 	int ref_valid, init_n, warmup; s64 init_acc;
 	int silent_blocks, was_running, applied_idx, want_idx;
 	int meas;                /* last block as measured at the tap, before compensation (mdB) */
+	int nodata;              /* worker loops without captured audio */
 	u32 loops, empty, bytes, blocks, maxchunk, dbg_d0, dbg_d4, dbg_wrap;
 } A = { .applied_idx = -1 };
 static void agc_force_reapply(void) { A.applied_idx = -1; }
@@ -349,6 +402,14 @@ static void agc_set_volume_locked(int idx)
 		if (c) ((u32 *)v)[i] = (u32)(((u64)c * g) >> 16);
 	}
 	if (!F.mix_setvol(pre, stereo, v)) A.applied_idx = idx;
+	if (hdmi_linked && hvol_base_ok) {
+		memcpy(v, hvol_base, VOLSZ);
+		for (i = 0; i < 64; i++) {
+			u32 c = ((u32 *)hvol_base)[i];
+			if (c) ((u32 *)v)[i] = (u32)(((u64)c * g) >> 16);
+		}
+		F.mix_setvol(pre, hstereo, v);
+	}
 }
 
 static void agc_reset_reference(void)
@@ -417,7 +478,11 @@ static inline s64 kfilt(const s64 *c, s64 *s, s64 x)
 
 static void agc_process(const s32 *p, u32 frames)
 {
-	u32 i;
+	u32 i, nz = 0;
+	/* digital silence (paused source, HDMI input without audio): clear the K-weighting state, the
+	 * fixed-point IIR would otherwise keep a small limit cycle alive and report it as loudness */
+	for (i = 0; i < 2 * frames && !nz; i++) nz = p[i] >> 9;
+	if (!nz) memset(A.kst, 0, sizeof(A.kst));
 	for (i = 0; i < frames; i++) {
 		int ch;
 		for (ch = 0; ch < 2; ch++) {
@@ -433,20 +498,24 @@ static void agc_process(const s32 *p, u32 frames)
 	}
 }
 
-static int eq_routed(void)   /* caller holds dec_mutex: is any real output fed by the EQ? */
+/* caller holds dec_mutex. Bits 2..4: output p is fed by the EQ; bit 8: some PCM output gets raw audio */
+static int eq_routed(void)
 {
-	int p;
-	for (p = 2; p < 5; p++)
-		if (*(void **)(dev + cur_off[p]) == eqconn) return 1;
-	return 0;
+	int p, m = 0;
+	for (p = 2; p < 5; p++) {
+		void *c = *(void **)(dev + cur_off[p]);
+		if (c == eqconn) m |= 1 << p;
+		else if (c && (c == stereo || (hdmiin && c == hstereo))) m |= 1 << 8;
+	}
+	return m;
 }
 
-static u32 relinks;
+static u32 rebuilds, rebuild_errors;
 
-/* worker: EQ chain repair after passthrough, and the ad brake (if its tap exists) */
+/* worker: keeps every PCM output on a working EQ chain, and runs the ad brake (if its tap exists) */
 static int agc_thread(void *unused)
 {
-	int eq_was_on;
+	int eq_was_on; unsigned long next_rebuild = jiffies;
 	mutex_lock(dec_mutex); eq_was_on = eq_routed(); mutex_unlock(dec_mutex);
 
 	while (!kthread_should_stop()) {
@@ -471,17 +540,25 @@ static int agc_thread(void *unused)
 		agc_set_volume_locked(ACCESS_ONCE(A.want_idx));
 		bape_unlock();
 
-		if (eq_on && !eq_was_on) {          /* back from passthrough: repair the EQ chain */
-			relink(2);
-			relinks++;
+		/* an output was (re-)attached to the EQ, or the driver put raw audio on one: rebuild.
+		 * At most once a second, so a driver that keeps re-routing cannot keep us busy. */
+		if (((eq_on & ~eq_was_on & 0x1c) || (eq_on & (1 << 8))) && time_after_eq(jiffies, next_rebuild)) {
+			if (rebuild()) rebuild_errors++;
+			rebuilds++;
+			next_rebuild = jiffies + HZ;
+			mutex_lock(dec_mutex); eq_on = eq_routed(); mutex_unlock(dec_mutex);
 		}
-		eq_was_on = eq_on;
+		if (!(eq_on & (1 << 8)) || time_after_eq(jiffies, next_rebuild)) eq_was_on = eq_on;
 
 		mutex_lock(&cfg_lock);
 		A.loops++;
 		if (running && !A.was_running) agc_reset_reference();   /* zap / restart */
 		A.was_running = running;
-		if (n) agc_process(agc_buf, n / 8); else A.empty++;
+		if (n) { agc_process(agc_buf, n / 8); A.nodata = 0; }
+		else {
+			A.empty++;
+			if (++A.nodata > 33) { A.meas = A.loud = -100000; A.ms_short = 0; }   /* > 1 s: nothing plays */
+		}
 		mutex_unlock(&cfg_lock);
 		msleep_interruptible(30);
 	}
@@ -518,9 +595,9 @@ static ssize_t agc_read(struct file *file, char __user *buf, size_t cnt, loff_t 
 {
 	char tmp[400];
 	int l = snprintf(tmp, sizeof(tmp), "mode %d\nloudness %d\nreference %d\ngain %d\nreference_valid %d\nactive %d\nmeasured %d\napplied %d\n"
-		"debug loops=%u empty=%u bytes=%u blocks=%u maxchunk=%u il=%u nbuf=%u wrap=%u relinks=%u\n",
+		"debug loops=%u empty=%u bytes=%u blocks=%u maxchunk=%u il=%u nbuf=%u wrap=%u rebuilds=%u/%u\n",
 		A.mode, A.loud, A.ref, A.gain, A.ref_valid, agccap != NULL, A.meas, -100 * A.applied_idx,
-		A.loops, A.empty, A.bytes, A.blocks, A.maxchunk, A.dbg_d0, A.dbg_d4, A.dbg_wrap, relinks);
+		A.loops, A.empty, A.bytes, A.blocks, A.maxchunk, A.dbg_d0, A.dbg_d4, A.dbg_wrap, rebuilds, rebuild_errors);
 	return simple_read_from_buffer(buf, cnt, pos, tmp, l);
 }
 static const struct file_operations agc_fops = { .owner = THIS_MODULE, .read = agc_read, .write = agc_write, .llseek = default_llseek };
@@ -547,6 +624,69 @@ static void teardown_agc(void)
 	if (agccap) { F.mix_rmout(agcmix, agcport); F.cap_close(agccap); agccap = NULL; }
 	agcmix = NULL;
 	if (vol_base_ok) F.mix_setvol(pre, stereo, vol_base);
+	if (hdmi_linked && hvol_base_ok) F.mix_setvol(pre, hstereo, hvol_base);
+}
+
+/* ---- diagnostics: connector dump and a level tap on the HDMI (MAI) mixer (module param maitap=1) ---- */
+static int maitap;
+module_param(maitap, int, 0444);
+static void *maicap, *maiport, *maimix;
+
+static ssize_t conn_read(struct file *file, char __user *buf, size_t cnt, loff_t *pos)
+{
+	static const int offs[] = { 0x08, 0xf8, 0xfc, 0x100, 0x104, 0x108, 0x10c, 0x29c, 0x43c };
+	char tmp[700]; int l = 0, i, p;
+	mutex_lock(dec_mutex);
+	l += snprintf(tmp + l, sizeof(tmp) - l, "stereo %p eqconn %p preconn %p hstereo %p hdmi linked %d running %d\n", stereo, eqconn, preconn, hstereo, hdmi_linked, hdmi_running());
+	for (i = 0; i < ARRAY_SIZE(offs); i++)
+		l += snprintf(tmp + l, sizeof(tmp) - l, "dev+%03x %p\n", offs[i], *(void **)(dev + offs[i]));
+	for (p = 0; p < 5; p++)
+		l += snprintf(tmp + l, sizeof(tmp) - l, "%-10s cur %p mixer %p\n", pname[p], *(void **)(dev + cur_off[p]), *(void **)(dev + mix_off[p]));
+	l += snprintf(tmp + l, sizeof(tmp) - l, "dec running %u\n", *(u32 *)(dec + 0xf4));
+	mutex_unlock(dec_mutex);
+	return simple_read_from_buffer(buf, cnt, pos, tmp, l);
+}
+static const struct file_operations conn_fops = { .owner = THIS_MODULE, .read = conn_read, .llseek = default_llseek };
+
+static int mdb_from_energy(u64 e);
+/* mean square of the HDMI mixer output over ~300 ms, in mdB (0 = full-scale square) */
+static ssize_t level_read(struct file *file, char __user *buf, size_t cnt, loff_t *pos)
+{
+	char tmp[64]; u8 d[96]; u32 n = 0, i; u64 acc = 0; int l, db = -999999; s32 *p;
+	if (*pos) return 0;
+	if (!maicap) return -ENODEV;
+	bape_lock();
+	if (!F.cap_getbuffer(maicap, d) && (n = *(u32 *)(d + 72) & ~7u)) F.cap_consume(maicap, n);
+	bape_unlock();
+	msleep(300);
+	bape_lock();
+	n = 0;
+	if (!F.cap_getbuffer(maicap, d)) {
+		p = *(s32 **)(d + 8); n = *(u32 *)(d + 72) & ~7u;
+		if (p) for (i = 0; i < n / 4; i++) { s64 x = p[i] >> 12; acc += (u64)(x * x); }
+		if (n) F.cap_consume(maicap, n);
+	}
+	bape_unlock();
+	if (n && acc) db = mdb_from_energy(div_u64(acc, n / 4)) - 116000 - 840;   /* 20*log10(2^19)+... ~ dBFS */
+	l = snprintf(tmp, sizeof(tmp), "%d %u\n", db, n);
+	return simple_read_from_buffer(buf, cnt, pos, tmp, l);
+}
+static const struct file_operations level_fops = { .owner = THIS_MODULE, .read = level_read, .llseek = default_llseek };
+
+static void setup_maitap(void)
+{
+	u8 cs[32];
+	maimix = *(void **)(dev + mix_off[maitap >= 2 && maitap <= 4 ? maitap : 3]);   /* 1/3 = HDMI, 4 = S/PDIF, 2 = DAC */
+	F.cap_getdefs(cs);
+	if (F.cap_open(hApe, 3, cs, &maicap)) { maicap = NULL; return; }
+	F.cap_getport(maicap, &maiport);
+	if (F.mix_addout(maimix, maiport)) { F.cap_close(maicap); maicap = NULL; return; }
+	pr_info("dm920eq: MAI level tap ready\n");
+}
+static void teardown_maitap(void)
+{
+	if (!maicap) return;
+	F.mix_rmout(maimix, maiport); F.cap_close(maicap); maicap = NULL;
 }
 
 static void setup_taps(void)
@@ -593,6 +733,8 @@ static int __init eq_init(void)
 	F.mix_getconn(pre, &preconn);
 	ret = F.eq_addinput(eq, preconn); if (ret) goto err_pre;
 	F.eq_getconn(eq, &eqconn);
+	dec1_mutex = (struct mutex *)(dev + HDMI_MTX_OFF);
+	hstereo = *(void **)(dev + HDMI_CONN_OFF);
 
 	/* only the decoder mutex here (as the driver does around decoder stop/start); the AGC thread is
 	 * not running yet, and b_lock must not be held across bcm_audio_decoder_stop/start */
@@ -614,8 +756,13 @@ static int __init eq_init(void)
 	}
 	/* let the driver route the EQ output wherever it would route plain stereo */
 	*(void **)(dev + 0xfc) = eqconn;
+	/* HDMI input: its audio also enters the pre mixer. The driver keeps routing the raw HDMI connector
+	 * to the outputs when the input starts; the worker thread then moves those outputs to the EQ.
+	 * Only connected while the HDMI decoder is idle (otherwise later, from rebuild()). */
+	if (hdmiin) link_hdmi(0);
 	if (taps) setup_taps();
 	if (agc) setup_agc();
+	if (maitap) setup_maitap();
 	if (running) F.dec_start(dec);
 	mutex_unlock(dec_mutex);
 
@@ -626,6 +773,8 @@ static int __init eq_init(void)
 		proc_create("status", 0644, pdir, &status_fops);
 		proc_create("agc", 0644, pdir, &agc_fops);
 		if (taps) proc_create("capture", 0444, pdir, &cap_fops);
+		proc_create("conn", 0444, pdir, &conn_fops);
+		if (maicap) proc_create("level", 0444, pdir, &level_fops);
 	}
 	agc_task = kthread_run(agc_thread, NULL, "dm920eq");
 	if (IS_ERR(agc_task)) agc_task = NULL;
@@ -639,32 +788,44 @@ err_st: F.st_destroy(stage);
 
 static void __exit eq_exit(void)
 {
-	u8 ms[16]; int running, p, ret;
+	u8 ms[16]; int running, hd_run, p, ret;
+	void *hdec = *(void **)(dev + HDMI_DEC_OFF);
 	if (agc_task) kthread_stop(agc_task);
 	if (pdir) {
 		if (taps) remove_proc_entry("capture", pdir);
+		remove_proc_entry("conn", pdir);
+		if (maicap) remove_proc_entry("level", pdir);
 		remove_proc_entry("gain", pdir); remove_proc_entry("biquads", pdir);
 		remove_proc_entry("status", pdir); remove_proc_entry("agc", pdir);
 		remove_proc_entry("dm920eq", NULL);
 	}
 	mutex_lock(dec_mutex);
+	if (hdmi_linked) mutex_lock(dec1_mutex);
 	running = *(u32 *)(dec + 0xf4);
+	hd_run = hdmi_running();
 	if (running) F.dec_stop(dec);
+	if (hd_run) F.bdec_stop(hdec);
 	if (*(void **)(dev + 0xfc) == eqconn) *(void **)(dev + 0xfc) = stereo;
+	teardown_maitap();
 	teardown_agc();
 	teardown_taps();
 	for (p = 0; p < 5; p++) {
 		void *mix = *(void **)(dev + mix_off[p]);
+		/* while the HDMI input plays, its own connector goes back to HDMI/S/PDIF (as the driver routes it) */
+		void *back = hd_run && p != 2 ? hstereo : stereo;
 		if (*(void **)(dev + cur_off[p]) != eqconn) continue;
 		ret = F.mix_rm(mix, eqconn);
 		F.mix_getdef(ms); ms[0] = 1;
-		ret |= F.mix_add(mix, stereo, ms);
-		*(void **)(dev + cur_off[p]) = stereo;
+		ret |= F.mix_add(mix, back, ms);
+		*(void **)(dev + cur_off[p]) = back;
 		pr_info("dm920eq: %s restored ret=%d\n", pname[p], ret);
 	}
 	F.mix_rm(pre, stereo);
+	if (hdmi_linked) F.mix_rm(pre, hstereo);
 	F.eq_rminput(eq, preconn);
+	if (hd_run) F.bdec_start(hdec, dev + HDMI_SET_OFF);
 	if (running) F.dec_start(dec);
+	if (hdmi_linked) mutex_unlock(dec1_mutex);
 	mutex_unlock(dec_mutex);
 	F.eq_destroy(eq); F.st_destroy(stage); F.mix_destroy(pre);
 	pr_info("dm920eq: removed\n");

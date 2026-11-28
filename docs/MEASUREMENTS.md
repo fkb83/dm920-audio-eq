@@ -141,6 +141,34 @@ DD+ gemischt): 0 DSP-Neustarts, die EQ-Kette wurde genau nach den beiden DD+-Sen
 - Absenkung erzwungen (−8 … −10 dB): unkorrigierter Messwert fällt um 9–11 dB, die korrigierte Lautheit
   bleibt beim Bezugspegel (−18 … −20 dB bei Bezug −20 dB).
 
+### HDMI-Eingang (v1.3.0)
+
+Für diese Messungen hängt ein Abgriff direkt am HDMI-Ausgangs-Mixer (`maitap=1`, `/proc/dm920eq/level`).
+Gemessen wird, wie stark der Pegel am HDMI-Ausgang fällt, wenn der EQ-Pegel von 0 auf −12 dB geht
+(Mittel aus je zwei Messungen; das laufende Programm schwankt, Einzelwerte streuen um ±3 dB).
+
+| Zustand | Wirkung am HDMI-Ausgang |
+|---|---|
+| v1.2.0, TV frisch | −13,1 dB |
+| v1.2.0, nach HDMI-Eingang und zurück | **+0,6 dB – EQ wirkungslos** |
+| v1.3.0, gemischte Folge (unten), an allen TV-Punkten | −11,7 … −13,4 dB |
+| v1.3.0, nach Standby und Aufwachen | −10,0 dB |
+| v1.3.0, nach Radio-Taste → HDMI-Eingang → Exit | −13,9 dB |
+
+Gemischte Folge, nach jedem Schritt geprüft, ob alle PCM-Ausgänge am EQ hängen: VOX → HDMI-Eingang → TV →
+RTL UHD (DD+) → SAT.1 → UHD1 (DD+) → HDMI-Eingang direkt aus DD+ → TV → arte (MPEG) → HDMI-Eingang → TV
+→ ZDF. Ergebnis: jeder Zustand korrekt, 0 DSP-Watchdog-Neustarts, 0 Kernel-Fehler, 0 gescheiterte
+Umbauten. Laden des Moduls bei laufendem HDMI-Eingang: Eingang wird sofort eingebunden.
+
+**Ton des HDMI-Eingangs durch den EQ:** In einer Vorversion mit laufender Musik vom Apple TV: −11,8 dB
+Wirkung bei −12 dB. Für v1.3.0 lieferte der Apple TV während der Tests nur digitale Stille; belegt ist hier,
+dass der Datenstrom des HDMI-Eingangs durch die EQ-Kette zu allen Ausgängen fließt, nicht die Filterwirkung
+mit Musik.
+
+**Stille:** Das Festkomma-K-Filter der Lautheitsmessung hielt bei digitaler Stille einen konstanten
+Grenzzyklus (gemessen −20 … −78 dB je nach Zustand beim Verstummen). Seit v1.3.0 wird es bei
+vollständig stillen Blöcken zurückgesetzt; Stille misst −∞.
+
 ## Was nicht gemessen wurde
 
 Der Abgriff hinter dem EQ ist derselbe Connector, an dem auch der HDMI-Mixer hängt. Das analoge

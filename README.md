@@ -6,7 +6,8 @@ nutzbar macht und eine automatische Lautstärkeregelung gegen zu laute Werbung m
 
 Der EQ sitzt direkt im Audiopfad zwischen Decoder und den Ausgängen **HDMI, S/PDIF und DAC**.
 Er rechnet in der Audio-Hardware des Chips – ohne CPU-Last, ohne Verzögerung, für Live-TV,
-Aufnahmen und jeden Sender.
+Aufnahmen, jeden Sender **und den HDMI-Eingang** der Box. Einstellen lässt er sich am Fernseher oder
+live vom Handy aus.
 
 <p align="center"><img src="docs/images/plugin-ui.png" width="640" alt="Plugin-Oberfläche"></p>
 
@@ -27,7 +28,13 @@ Aufnahmen und jeden Sender.
 - **Werbe-Bremse** (Lautstärke-Automatik, *leicht / mittel / stark*): misst laufend die Lautheit und senkt
   ab, wenn es deutlich lauter wird als das laufende Programm – z. B. bei Werbung oder Trailern. Sie senkt nur
   ab, hebt nie an. Live-Anzeige der aktuellen Absenkung im Plugin
-- Übersteht Senderwechsel und Wechsel des Tonformats (MPEG ↔ AC3 ↔ Dolby Digital 5.1 Downmix)
+- **HDMI-Eingang:** Ton von einem angeschlossenen Gerät (z. B. Apple TV) läuft ebenfalls durch EQ und
+  Werbe-Bremse
+- **Web-Seite fürs Handy** unter `http://<IP-der-Box>/eq` – EQ live einstellen, Quelle umschalten,
+  Werbe-Bremse beobachten. Lässt sich auf dem iPhone als App-Symbol auf den Home-Bildschirm legen
+- **Radio-Taste → HDMI-Eingang** (abschaltbar): ein Tastendruck statt Blau – 6 – Gelb; zurück mit Exit
+- Übersteht Senderwechsel, Wechsel des Tonformats (MPEG ↔ AC3 ↔ DD+-Passthrough), Wechsel zwischen TV
+  und HDMI-Eingang, Standby und Neustarts des Audio-Prozessors
 - Startet automatisch mit Enigma2, Einstellungen bleiben gespeichert
 
 ## Gemessen, nicht geschätzt
@@ -76,6 +83,19 @@ und startet Enigma2 neu.
 
 ## Bedienung
 
+### Am Handy
+
+Im Browser `http://<IP-der-Box>/eq` öffnen (iPhone: *Teilen → Zum Home-Bildschirm*).
+
+<p align="center"><img src="docs/images/web-ui-1.jpg" width="270" alt="Web-Seite: Equalizer"> &nbsp;
+<img src="docs/images/web-ui-2.jpg" width="270" alt="Web-Seite: Pegel, Werbe-Bremse, Radio-Taste"></p>
+
+Regler ziehen ist sofort hörbar; beim Loslassen wird gespeichert. Oben lässt sich zwischen Fernsehen
+und HDMI-Eingang umschalten. Die Seite läuft in der Weboberfläche der Box (gleicher Port 80, kein
+Passwortschutz – wie die übrige Weboberfläche nur fürs Heimnetz gedacht).
+
+### Am Fernseher
+
 **Blaue Taste → Erweiterungen → Hardware-Equalizer**
 
 | Taste | Funktion |
@@ -101,6 +121,12 @@ Den Programmpegel lernt sie selbst: nach dem Umschalten in 3 s grob, in der erst
 langsam (+0,6 dB/min nach oben, −1,2 dB/min nach unten), damit eine Werbepause nicht als „neuer
 Normalpegel“ gelernt wird. Absenken dauert etwa eine halbe Sekunde, zurück geht es mit 1,5 dB/s.
 Ein schneller Spitzen-Limiter ist das nicht – kurze Knalle gehen durch.
+
+### HDMI-Eingang mit der Radio-Taste
+
+Die Radio-Taste öffnet den HDMI-Eingang (wie *Blau → HDMI → Abspielen* des New-Nigma-Plugins), Exit
+kehrt zum Sender zurück. Abschaltbar im Plugin („Radio-Taste schaltet auf HDMI-Eingang“) oder auf der
+Web-Seite; dann öffnet sie wieder die Radioliste.
 
 ### Wichtig: Downmix einstellen
 
@@ -130,12 +156,20 @@ nachher:  Decoder ──stereo──▶ Zwischen-Mixer ──▶ BAPE-Equalizer 
 5. Für die Werbe-Bremse hängt ein Abgriff (`BAPE_OutputCapture`) am DAC-Mixer des Treibers. Ein
    Kernel-Thread misst die Lautheit nach ITU-R BS.1770, rechnet die eigene Absenkung heraus und regelt
    die Eingangslautstärke des Zwischen-Mixers; die Mixer-Hardware blendet weich über.
-6. Alle Treiberaufrufe laufen unter den Sperren des Treibers selbst. Nach Sendern mit DD+-Passthrough
-   verknüpft der Thread die EQ-Kette neu, weil der Treiber sie sonst ins Leere laufen lässt.
+6. Der HDMI-Eingang (zweiter Decoder des Treibers) speist ebenfalls den Zwischen-Mixer.
+7. Der Equalizer-Baustein verarbeitet nur für die Ausgänge, die beim Anschließen seines Eingangs schon
+   da waren. Hängt der Treiber Ausgänge neu an (DD+-Passthrough zurück, HDMI-Eingang), hält der Thread
+   kurz die Decoder an, hängt alle Ausgänge an den EQ und schließt ihn neu an.
+8. Alle Treiberaufrufe laufen unter den Sperren des Treibers selbst.
 
 Entladen (`rmmod dm920eq`) stellt den Originalzustand wieder her.
 
 ## Versionen
+
+- **1.3.0** – HDMI-Eingang: Der EQ wirkte nach einem Ausflug auf den HDMI-Eingang am HDMI-Ausgang nicht
+  mehr (gemessen: 0 dB statt −12 dB). Behoben; außerdem läuft der Ton des HDMI-Eingangs jetzt selbst
+  durch EQ und Werbe-Bremse. Neu: Web-Seite fürs Handy, Radio-Taste öffnet den HDMI-Eingang. Die
+  Werbe-Bremse wertet Stille nicht mehr als leises Geräusch.
 
 - **1.2.0** – Stabilität: Die Box konnte einfrieren, wenn der Audio-DSP neu startete, während die
   Werbe-Bremse maß (Absturz im Mess-Thread, Treibersperre blieb belegt). Der Messabgriff löste außerdem
@@ -150,7 +184,7 @@ Entladen (`rmmod dm920eq`) stellt den Originalzustand wieder her.
 | Pfad | Inhalt |
 |---|---|
 | [`kernel/`](kernel) | Kernelmodul `dm920eq.c` |
-| [`plugin/HardwareEQ/`](plugin/HardwareEQ) | Enigma2-Plugin (Python 2.7) und Filterberechnung `eqmath.py` |
+| [`plugin/HardwareEQ/`](plugin/HardwareEQ) | Enigma2-Plugin (Python 2.7), Filterberechnung `eqmath.py`, Web-Seite (`webui.py`, `web/`) |
 | [`build/`](build) | Docker-Build-Umgebung, Kernel-Vorbereitung mit Prüfsummen |
 | [`tools/`](tools) | Koeffizienten-Rechner und Messauswertung |
 | [`docs/`](docs) | Architektur, Build, Messungen |

@@ -24,6 +24,6 @@ echo "copying plugin..."
 	rmmod dm920eq 2>/dev/null || true
 	rm -rf $DEST && mkdir -p $(dirname $DEST) && tar -C $(dirname $DEST) -xzf - 2>/dev/null
 	chown -R root:root $DEST
-	python -m py_compile $DEST/plugin.py $DEST/eqmath.py
+	python -m py_compile $DEST/plugin.py $DEST/eqmath.py $DEST/webui.py
 	systemctl restart enigma2"
 echo "done - open it with: blue button -> Erweiterungen -> Hardware-Equalizer"

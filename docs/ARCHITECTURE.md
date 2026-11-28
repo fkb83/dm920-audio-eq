@@ -164,14 +164,60 @@ dann dem Decoder-Mutex (dieselbe Reihenfolge wie im Treiber). Der Thread kopiert
 und rechnet ohne Sperre. Nur Laden/Entladen nimmt allein den Decoder-Mutex, weil dort der Decoder
 gestoppt und gestartet wird.
 
-## Passthrough (DD+/DTS) und EQ
+## Wenn der Treiber Ausgänge umhängt
 
-Bei DD+-Passthrough entfernt der Treiber den EQ-Ausgang aus allen Ausgangs-Mixern und hängt ihn beim
-Zurückschalten auf PCM wieder an. Danach verarbeitet die EQ-Kette nichts mehr: Das Signal am Ausgang
-entspricht dem unbearbeiteten Eingang, Filter und Stellglied wirken nicht (gemessen, bis v1.1.0 blieb
-das bis zum Neustart von Enigma2 so). Der Thread erkennt den Übergang Passthrough → PCM und verknüpft
-EQ-Eingang und -Ausgänge neu (`relink`, kurze Tonpause direkt nach dem Senderwechsel). Danach misst
-die volle EQ-Wirkung wieder. Die Anzahl steht in `/proc/dm920eq/agc` unter `relinks`.
+Der BAPE-Equalizer verarbeitet nur für die Abnehmer, die er hatte, als sein Eingang angeschlossen wurde.
+Entfernt der Treiber den EQ-Connector aus einem Ausgangs-Mixer und hängt ihn wieder an, bekommt dieser
+Ausgang den **unbearbeiteten** Ton – Filter und Stellglied wirken dort nicht mehr (gemessen). Das passiert:
+
+| Auslöser | was der Treiber tut |
+|---|---|
+| DD+/DTS-Passthrough und zurück | EQ von allen Ausgängen ab, beim Zurückschalten wieder an |
+| HDMI-Eingang starten | an HDMI und S/PDIF den aktuellen Eingang durch den HDMI-Eingang ersetzen (DAC bleibt) |
+| HDMI-Eingang beenden | den TV-Connector anhängen – nur wenn dort nicht schon der TV-Connector hängt |
+
+Bis v1.2.0 hat der Thread nur Passthrough → PCM bemerkt (dort waren *alle* Ausgänge weg). Beim HDMI-
+Eingang blieb der DAC am EQ, der Wechsel blieb unbemerkt, und HDMI/S/PDIF liefen danach roh.
+
+Seit v1.3.0 prüft der Thread jede Runde jeden PCM-Ausgang und ruft `rebuild()`, wenn
+
+- ein Ausgang neu an den EQ gehängt wurde, oder
+- ein Ausgang den rohen TV- oder HDMI-Eingangs-Connector bekommen hat.
+
+`rebuild()` nimmt die Decoder-Mutexe (TV, dann HDMI-Eingang – Reihenfolge wie im Treiber), hält beide
+Decoder an (TV über `bcm_audio_decoder_stop`, HDMI-Eingang über `BAPE_Decoder_Stop` – so wie der Treiber
+selbst bei einem Formatwechsel des HDMI-Eingangs), hängt alle PCM-Ausgänge an den EQ, schließt den EQ-
+Eingang neu an und startet wieder, was lief. Danach ist der Zustand so, dass der Treiber beim Beenden des
+HDMI-Eingangs nichts mehr umhängt (an HDMI hängt schon „sein“ TV-Connector). Kosten: eine kurze Tonpause
+direkt beim Umschalten. Höchstens ein `rebuild()` pro Sekunde.
+
+Versucht und verworfen:
+
+- **Fester Mixer hinter dem EQ**, damit der EQ nie neue Abnehmer bekommt: Ein Mixer-Connector versorgt
+  hier nur einen weiteren Mixer – S/PDIF und DAC blieben stumm.
+- **Neu anschließen, ohne die Decoder anzuhalten:** `BAPE_Equalizer_RemoveInput` scheitert bei laufender
+  Quelle; der halbe Umbau beschädigte die Verbindungsliste des Treibers (Endlosschleife beim Entladen).
+
+## HDMI-Eingang
+
+Der Treiber spielt den HDMI-Eingang auf seinem Decoder 1. Relevante Stellen (relativ zu `dev`):
+
+| Offset | Inhalt |
+|---|---|
+| `+0x29c` | Stereo-Connector des HDMI-Eingangs (im Log „stereo (hdmi-rx)“) |
+| `+0x294` | BAPE-Decoder-Handle; Zustand bei Handle `+0x3e4` (0 = gestoppt) |
+| `+0x300` | Start-Einstellungen, mit denen der Treiber den Decoder startet |
+| `+0x400` | Mutex von Decoder 1 |
+
+Das Modul hängt diesen Connector zusätzlich an den Zwischen-Mixer (nur bei gestopptem Decoder; läuft der
+HDMI-Eingang gerade, holt `rebuild()` das nach). Den Connector-Eintrag des Treibers lässt es
+unverändert: Ein umgebogener Eintrag führte dazu, dass der Treiber beim Start des HDMI-Eingangs gar nicht
+mehr verdrahtete und die Ausgänge nicht startete. Die Werbe-Bremse regelt beide Eingänge des
+Zwischen-Mixers gleich.
+
+Gestartet und beendet wird der HDMI-Eingang vom New-Nigma-Plugin (`Plugins/newnigma2/hdmi`, Funktion
+`HDMID(session)` öffnet die Wiedergabe direkt, `HdmiMain.leave()` beendet sie). Das EQ-Plugin ruft genau
+diese Funktionen für die Radio-Taste und die Web-Seite auf.
 
 ## Kernel-Schnittstelle `/proc/dm920eq/`
 
@@ -179,9 +225,11 @@ die volle EQ-Wirkung wieder. Die Anzahl steht in `/proc/dm920eq/agc` unter `reli
 |---|---|---|
 | `biquads` | schreiben | `N c0 c1 … c(5N-1)` – N Biquads, je `b0 b1 b2 a1 a2` als Q5.26-Ganzzahlen |
 | `gain` | lesen/schreiben | einfacher Pegel in Promille (0–1000, nur absenken) |
-| `status` | lesen/schreiben | lesen: welcher Ausgang am EQ hängt, ob die Treiber-Umleitung aktiv ist; schreiben `2`: EQ-Kette neu verknüpfen (Diagnose) |
+| `status` | lesen/schreiben | lesen: welcher Ausgang am EQ hängt, Treiber-Umleitung, HDMI-Eingang; schreiben `1`: `rebuild()` auslösen (Diagnose) |
 | `agc` | lesen/schreiben | Werbe-Bremse: schreiben `0`–`3` (aus/leicht/mittel/stark) oder `4 <margin_mdB> <ratio×10> <maxred_mdB>`; lesen liefert Lautheit, Bezug, aktuelle Absenkung, unkorrigierten Messwert (`measured`) und gesetzte Absenkung (`applied`) in milli-dB |
 | `capture` | lesen | nur mit `taps=1`: Mitschnitt vor und hinter dem EQ (siehe [MEASUREMENTS.md](MEASUREMENTS.md)) |
+| `level` | lesen | nur mit `maitap=1`: mittlerer Pegel am HDMI-Ausgangs-Mixer über 300 ms (`<mdB> <bytes>`) |
+| `conn` | lesen | Diagnose: Connector-Zeiger des Treibers und der Kette |
 
 Beispiel – eine Glocke bei 1 kHz mit −6 dB:
 
@@ -201,11 +249,16 @@ ein. Bei Übersteuerung begrenzt die Hardware sauber auf Vollaussteuerung (siehe
 |---|---|---|
 | `gain_permille` | 1000 | Startpegel |
 | `taps` | 0 | 1 = zwei Mitschnitt-Abgriffe (vor/hinter EQ) für Messungen anlegen. Nur für Messungen: diese Abgriffe hängen direkt am Decoder und lösen beim Wechsel von DD+-Passthrough auf PCM DSP-Abstürze aus |
-| `agc` | 1 | 0 = keine Werbe-Bremse (kein Abgriff); die Reparatur nach Passthrough läuft trotzdem |
+| `agc` | 1 | 0 = keine Werbe-Bremse (kein Abgriff); `rebuild()` läuft trotzdem |
+| `hdmiin` | 1 | 0 = HDMI-Eingang nicht durch den EQ führen |
+| `maitap` | 0 | Messabgriff am Ausgangs-Mixer für `/proc/dm920eq/level`: 1/3 = HDMI, 4 = S/PDIF (nur beim Laden im TV-Betrieb; die Mixer müssen dafür stehen) |
 
 ## Grenzen
 
 - Nur PCM-Stereo vom Hauptdecoder. Passthrough und Mehrkanal-PCM laufen am EQ vorbei.
-- Koeffizienten sind für 48 kHz gerechnet (DVB). Bei 44,1 kHz verschieben sich Frequenzen um ~8 %.
-- Getestet: Senderwechsel MPEG/AC3/DD+ (Passthrough) in beliebiger Reihenfolge, DSP-Watchdog-Neustarts.
-- Ungetestet: Aufwachen aus dem Standby mit Bild, Mediaplayer, Bild-in-Bild, Transcoding.
+- Koeffizienten sind für 48 kHz gerechnet (DVB). Liefert der HDMI-Eingang 44,1 kHz (Musik), verschieben
+  sich die Frequenzen um ~8 %, falls der Zwischen-Mixer mit der Eingangsrate läuft (nicht gemessen).
+- Getestet: Senderwechsel MPEG/AC3/DD+ (Passthrough) in beliebiger Reihenfolge, TV ↔ HDMI-Eingang (auch
+  direkt aus einem DD+-Sender), Standby/Aufwachen, Laden des Moduls während der HDMI-Eingang läuft,
+  DSP-Watchdog-Neustarts.
+- Ungetestet: Mediaplayer, Bild-in-Bild, Transcoding, HDMI-Eingang mit Mehrkanal-/Bitstream-Ton.
