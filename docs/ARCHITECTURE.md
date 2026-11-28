@@ -216,6 +216,12 @@ mehr verdrahtete und die Ausgänge nicht startete. Die Werbe-Bremse regelt nur d
 Zwischen-Mixers. Solange der HDMI-Eingang spielt (und der TV-Decoder steht), ignoriert sie den Abgriff und
 steht auf 0 dB; `/proc/dm920eq/agc` meldet dann `hdmi_input 1`.
 
+**Zwei Filtersätze:** `/proc/dm920eq/biquads` ist der TV-Satz, `/proc/dm920eq/biquads_hdmi` der Satz
+für den HDMI-Eingang. Das Modul hält beide und lädt im Thread den passenden in die Equalizer-Stage: HDMI,
+sobald der HDMI-Decoder spielt und der TV-Decoder steht; TV, sobald der TV-Decoder spielt; stehen beide,
+bleibt der aktuelle. Umschalten dauert höchstens eine Thread-Runde (~30 ms). Ein nie geschriebener
+HDMI-Satz fällt auf den TV-Satz zurück. `status` zeigt den geladenen Satz (`eq-set`).
+
 Gestartet und beendet wird der HDMI-Eingang vom New-Nigma-Plugin (`Plugins/newnigma2/hdmi`, Funktion
 `HDMID(session)` öffnet die Wiedergabe direkt, `HdmiMain.leave()` beendet sie). Das EQ-Plugin ruft genau
 diese Funktionen für die Radio-Taste und die Web-Seite auf.
@@ -224,7 +230,8 @@ diese Funktionen für die Radio-Taste und die Web-Seite auf.
 
 | Datei | Richtung | Inhalt |
 |---|---|---|
-| `biquads` | schreiben | `N c0 c1 … c(5N-1)` – N Biquads, je `b0 b1 b2 a1 a2` als Q5.26-Ganzzahlen |
+| `biquads` | schreiben | TV-Filtersatz: `N c0 c1 … c(5N-1)` – N Biquads, je `b0 b1 b2 a1 a2` als Q5.26-Ganzzahlen |
+| `biquads_hdmi` | schreiben | Filtersatz für den HDMI-Eingang, gleiches Format |
 | `gain` | lesen/schreiben | einfacher Pegel in Promille (0–1000, nur absenken) |
 | `status` | lesen/schreiben | lesen: welcher Ausgang am EQ hängt, Treiber-Umleitung, HDMI-Eingang; schreiben `1`: `rebuild()` auslösen (Diagnose) |
 | `agc` | lesen/schreiben | Werbe-Bremse: schreiben `0`–`3` (aus/leicht/mittel/stark) oder `4 <margin_mdB> <ratio×10> <maxred_mdB>`; lesen liefert Lautheit, Bezug, aktuelle Absenkung, unkorrigierten Messwert (`measured`) und gesetzte Absenkung (`applied`) in milli-dB |

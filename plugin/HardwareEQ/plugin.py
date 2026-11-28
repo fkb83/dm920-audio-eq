@@ -21,17 +21,65 @@ GAIN_CHOICES = [(str(v), "%+d dB" % v if v else "0 dB") for v in range(eqmath.GA
 LEVEL_CHOICES = [(str(v), "%d dB" % v if v else "0 dB") for v in range(0, -13, -1)]
 
 config.plugins.hardwareeq = ConfigSubsection()
-config.plugins.hardwareeq.enabled = ConfigYesNo(default=True)
-config.plugins.hardwareeq.preset = ConfigSelection(default="flat", choices=[(k, n) for k, n, g in eqmath.PRESETS])
-config.plugins.hardwareeq.level = ConfigSelection(default="0", choices=LEVEL_CHOICES)
-config.plugins.hardwareeq.protect = ConfigYesNo(default=False)
 config.plugins.hardwareeq.agc = ConfigSelection(default="0", choices=[
 	("0", "aus"), ("1", "leicht (bis -6 dB)"), ("2", "mittel (bis -10 dB)"), ("3", "stark (bis -15 dB)")])
 config.plugins.hardwareeq.radio_hdmi = ConfigYesNo(default=True)
-BANDS_CFG = []
-for _i in range(len(eqmath.BANDS)):
-	setattr(config.plugins.hardwareeq, "band%d" % _i, ConfigSelection(default="0", choices=GAIN_CHOICES))
-	BANDS_CFG.append(getattr(config.plugins.hardwareeq, "band%d" % _i))
+
+
+class Profile(object):
+	"""One EQ setting (enabled, preset, level, protect, 8 bands). "tv" keeps the original config
+	names (band0 ...), "hdmi" uses the prefix hdmi_. The module loads the matching set by itself."""
+
+	def __init__(self, key, prefix, name, proc):
+		cfg = config.plugins.hardwareeq
+		self.key, self.name, self.proc = key, name, proc
+		setattr(cfg, prefix + "enabled", ConfigYesNo(default=True))
+		setattr(cfg, prefix + "preset", ConfigSelection(default="flat", choices=[(k, n) for k, n, g in eqmath.PRESETS]))
+		setattr(cfg, prefix + "level", ConfigSelection(default="0", choices=LEVEL_CHOICES))
+		setattr(cfg, prefix + "protect", ConfigYesNo(default=False))
+		self.enabled = getattr(cfg, prefix + "enabled")
+		self.preset = getattr(cfg, prefix + "preset")
+		self.level = getattr(cfg, prefix + "level")
+		self.protect = getattr(cfg, prefix + "protect")
+		self.bands = []
+		for i in range(len(eqmath.BANDS)):
+			setattr(cfg, "%sband%d" % (prefix, i), ConfigSelection(default="0", choices=GAIN_CHOICES))
+			self.bands.append(getattr(cfg, "%sband%d" % (prefix, i)))
+
+	def items(self):
+		return [self.enabled, self.preset, self.level, self.protect] + self.bands
+
+	def gains(self):
+		return [int(b.value) for b in self.bands]
+
+	def set_preset(self, key):
+		for k, name, gains in eqmath.PRESETS:
+			if k == key:
+				self.preset.value = k
+				if gains is not None:
+					for b, g in zip(self.bands, gains):
+						b.value = str(g)
+				return True
+		return False
+
+	def match_preset(self):
+		"""after band edits: show a preset name again if the curve matches one"""
+		self.preset.value = "custom"
+		for k, n, g in eqmath.PRESETS:
+			if g is not None and list(g) == self.gains():
+				self.preset.value = k
+				return
+
+	def copy_from(self, other):
+		for a, b in zip(self.items(), other.items()):
+			a.value = b.value
+
+
+PROFILES = [Profile("tv", "", "Fernsehen", "biquads"), Profile("hdmi", "hdmi_", "HDMI-Eingang", "biquads_hdmi")]
+PROFILE = dict((p.key, p) for p in PROFILES)
+if PROFILE["hdmi"].preset.saved_value is None:      # first start with two profiles: HDMI starts as a copy
+	PROFILE["hdmi"].copy_from(PROFILE["tv"])
+BANDS_CFG = PROFILE["tv"].bands                      # compatibility
 
 
 def log(msg):
@@ -88,29 +136,32 @@ def read_agc():
 	return vals
 
 
-def current_gains():
-	return [int(b.value) for b in BANDS_CFG]
-
-
-def set_preset(key):
-	"""Select a preset; copies its gains into the bands (except "custom")."""
+def all_items():
 	cfg = config.plugins.hardwareeq
-	for k, name, gains in eqmath.PRESETS:
-		if k == key:
-			cfg.preset.value = k
-			if gains is not None:
-				for b, g in zip(BANDS_CFG, gains):
-					b.value = str(g)
-			return True
-	return False
+	items = [cfg.agc, cfg.radio_hdmi]
+	for p in PROFILES:
+		items += p.items()
+	return items
 
 
 def save_settings():
-	cfg = config.plugins.hardwareeq
-	for item in [cfg.enabled, cfg.preset, cfg.level, cfg.protect, cfg.agc, cfg.radio_hdmi] + BANDS_CFG:
+	for item in all_items():
 		item.save()
-	cfg.save()
+	config.plugins.hardwareeq.save()
 	configfile.save()
+
+
+def cancel_settings():
+	for item in all_items():
+		item.cancel()
+
+
+def active_profile():
+	"""which filter set the module has loaded right now ("tv" or "hdmi")"""
+	for line in read_status().splitlines():
+		if line.startswith("eq-set"):
+			return "hdmi" if line.split()[1] == "hdmi" else "tv"
+	return "tv"
 
 
 # ---- HDMI input (via the Newnigma2 "HDMI" plugin) ----
@@ -176,25 +227,28 @@ def close_hdmi(session):
 
 
 def apply_settings():
-	"""Push EQ curve and level control into the hardware.
-	Returns (preamp_db, max_boost_db) or None if the EQ is off or the module is missing."""
+	"""Push both EQ profiles and the level control into the hardware.
+	Returns {"tv": (preamp_db, max_boost_db) or None, "hdmi": ...}; None if the module is missing."""
 	cfg = config.plugins.hardwareeq
 	agc = cfg.agc.value
-	if not cfg.enabled.value and agc == "0":
+	if not any(p.enabled.value for p in PROFILES) and agc == "0":
 		if module_loaded():
-			write_proc("biquads", eqmath.flat_line())
+			for p in PROFILES:
+				write_proc(p.proc, eqmath.flat_line())
 			write_proc("agc", "0")
 		return None
 	if not load_module():
 		return None
 	write_proc("agc", agc)
-	if not cfg.enabled.value:
-		write_proc("biquads", eqmath.flat_line())
-		return None
-	biquads, preamp = eqmath.design(current_gains(), int(cfg.level.value), cfg.protect.value)
-	if write_proc("biquads", eqmath.to_line(biquads)):
-		return preamp, eqmath.max_gain_db(biquads)
-	return None
+	res = {}
+	for p in PROFILES:
+		if not p.enabled.value:
+			write_proc(p.proc, eqmath.flat_line())
+			res[p.key] = None
+			continue
+		biquads, preamp = eqmath.design(p.gains(), int(p.level.value), p.protect.value)
+		res[p.key] = (preamp, eqmath.max_gain_db(biquads)) if write_proc(p.proc, eqmath.to_line(biquads)) else None
+	return res
 
 
 class HardwareEQSetup(ConfigListScreen, Screen):
@@ -222,6 +276,9 @@ class HardwareEQSetup(ConfigListScreen, Screen):
 		self["key_blue"] = StaticText("EQ an/aus")
 		self["info"] = StaticText("")
 		self._busy = False
+		# which profile is edited: starts with the source that plays right now
+		self.which = ConfigSelection(default=active_profile() if hdmi_available() else "tv",
+			choices=[(p.key, p.name) for p in PROFILES])
 		ConfigListScreen.__init__(self, [], session=session, on_change=self.changed)
 		self["actions"] = ActionMap(["SetupActions", "ColorActions"], {
 			"cancel": self.cancel,
@@ -241,19 +298,25 @@ class HardwareEQSetup(ConfigListScreen, Screen):
 		self.onLayoutFinish.append(self.update)
 		self.onClose.append(self.timer.stop)
 
+	def prof(self):
+		return PROFILE[self.which.value]
+
 	def build(self):
 		cfg = config.plugins.hardwareeq
-		lst = [
-			getConfigListEntry("Werbe-Bremse (Lautstärke-Automatik)", cfg.agc),
-			getConfigListEntry("Equalizer aktiv", cfg.enabled),
-			getConfigListEntry("Voreinstellung", cfg.preset),
-			getConfigListEntry("Gesamtpegel (zusätzlich leiser)", cfg.level),
-			getConfigListEntry("Übersteuerungsschutz", cfg.protect),
+		p = self.prof()
+		lst = [getConfigListEntry("Werbe-Bremse (nur Fernsehen)", cfg.agc)]
+		if hdmi_available():
+			lst.append(getConfigListEntry("Equalizer einstellen für", self.which))
+		lst += [
+			getConfigListEntry("Equalizer aktiv", p.enabled),
+			getConfigListEntry("Voreinstellung", p.preset),
+			getConfigListEntry("Gesamtpegel (zusätzlich leiser)", p.level),
+			getConfigListEntry("Übersteuerungsschutz", p.protect),
 		]
+		for label, band in zip(eqmath.BAND_LABELS, p.bands):
+			lst.append(getConfigListEntry("Band %s" % label, band))
 		if hdmi_available():
 			lst.append(getConfigListEntry("Radio-Taste schaltet auf HDMI-Eingang", cfg.radio_hdmi))
-		for label, band in zip(eqmath.BAND_LABELS, BANDS_CFG):
-			lst.append(getConfigListEntry("Band %s" % label, band))
 		self["config"].list = lst
 		self["config"].l.setList(lst)
 
@@ -261,48 +324,44 @@ class HardwareEQSetup(ConfigListScreen, Screen):
 		if self._busy:
 			return
 		self._busy = True
-		cfg = config.plugins.hardwareeq
+		p = self.prof()
 		cur = self["config"].getCurrent()
-		if cur and cur[1] is cfg.preset:
-			for key, name, gains in eqmath.PRESETS:
-				if key == cfg.preset.value and gains is not None:
-					for b, g in zip(BANDS_CFG, gains):
-						b.value = str(g)
+		if cur and cur[1] is self.which:
+			self.build()
+		elif cur and cur[1] is p.preset:
+			p.set_preset(p.preset.value)
 			self["config"].l.setList(self["config"].list)
-		elif cur and cur[1] in BANDS_CFG:
-			cfg.preset.value = "custom"
+		elif cur and cur[1] in p.bands:
+			p.match_preset()
 			self["config"].l.setList(self["config"].list)
 		self._busy = False
 		self.update()
 
 	def update(self):
 		res = apply_settings()
-		cfg = config.plugins.hardwareeq
-		if not cfg.enabled.value:
-			txt = "Equalizer ist aus."
-		elif res is None:
+		p = self.prof()
+		other = PROFILE["hdmi" if p.key == "tv" else "tv"]
+		scope = (" – gilt nur, wenn %s läuft" % ("das Fernsehen" if p.key == "tv" else "der HDMI-Eingang")) if hdmi_available() else ""
+		if not p.enabled.value:
+			txt = "Equalizer für %s ist aus%s." % (p.name, scope)
+		elif res is None or res.get(p.key) is None:
 			txt = "Fehler: Treibermodul konnte nicht geladen werden."
 		else:
-			preamp, boost = res
+			preamp, boost = res[p.key]
 			status = read_status()
 			names = {"MAI(HDMI)": "HDMI", "SPDIF": "S/PDIF", "DAC": "DAC"}
-			lines = status.splitlines()
-			outs = [names[l.split()[0]] for l in lines if l.endswith(" EQ") and l.split()[0] in names]
+			outs = [names[l.split()[0]] for l in status.splitlines() if l.endswith(" EQ") and l.split()[0] in names]
 			where = ", ".join(outs) if outs else "keinem Ausgang (Passthrough/Mehrkanal?)"
-			if any(l.startswith("hdmi-in") and l.endswith(" EQ") for l in lines):
-				where += " (auch für den HDMI-Eingang)"
-			if boost > 0.05 and not cfg.protect.value:
-				txt = "EQ aktiv auf %s. Anhebung bis %+.1f dB" % (where, boost)
+			txt = "EQ %s%s (Ausgänge: %s)." % (p.name, scope, where)
+			if boost > 0.05 and not p.protect.value:
+				txt += " Anhebung bis %+.1f dB" % boost
 			elif preamp < -0.05:
-				txt = "EQ aktiv auf %s. Vorverstärkung %.1f dB" % (where, preamp)
-			else:
-				txt = "EQ aktiv auf %s." % where
+				txt += " Vorverstärkung %.1f dB" % preamp
+		if hdmi_available():
+			txt += "\nGerade aktiv: %s" % PROFILE[active_profile()].name
 		self.eq_info = txt
 		self.tick()
-		if cfg.agc.value != "0":
-			self.timer.start(1000, False)
-		else:
-			self.timer.stop()
+		self.timer.start(1000, False)
 
 	def tick(self):
 		txt = self.eq_info
@@ -321,17 +380,16 @@ class HardwareEQSetup(ConfigListScreen, Screen):
 		self["info"].setText(txt)
 
 	def reset(self):
-		for b in BANDS_CFG:
-			b.value = "0"
-		config.plugins.hardwareeq.preset.value = "flat"
-		config.plugins.hardwareeq.level.value = "0"
-		config.plugins.hardwareeq.protect.value = False
+		p = self.prof()
+		p.set_preset("flat")
+		p.level.value = "0"
+		p.protect.value = False
 		self["config"].l.setList(self["config"].list)
 		self.update()
 
 	def toggle(self):
-		cfg = config.plugins.hardwareeq
-		cfg.enabled.value = not cfg.enabled.value
+		p = self.prof()
+		p.enabled.value = not p.enabled.value
 		self["config"].l.setList(self["config"].list)
 		self.update()
 
@@ -340,8 +398,7 @@ class HardwareEQSetup(ConfigListScreen, Screen):
 		self.close()
 
 	def cancel(self):
-		for x in self["config"].list:
-			x[1].cancel()
+		cancel_settings()
 		apply_settings()
 		self.close()
 
@@ -376,7 +433,7 @@ def sessionstart(reason, **kwargs):
 	if reason != 0:
 		return
 	cfg = config.plugins.hardwareeq
-	if cfg.enabled.value or cfg.agc.value != "0":
+	if any(p.enabled.value for p in PROFILES) or cfg.agc.value != "0":
 		try:
 			apply_settings()
 		except Exception, e:

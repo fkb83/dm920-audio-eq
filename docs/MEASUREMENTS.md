@@ -169,6 +169,19 @@ mit Musik.
 Grenzzyklus (gemessen −20 … −78 dB je nach Zustand beim Verstummen). Seit v1.3.0 wird es bei
 vollständig stillen Blöcken zurückgesetzt; Stille misst −∞.
 
+### Getrennte Profile (v1.4.0)
+
+Testfilter am HDMI-Ausgang im TV-Betrieb (TV-Satz neutral, dann HDMI-Satz bzw. TV-Satz auf −12 dB):
+
+| Änderung | Wirkung auf den TV-Ton |
+|---|---|
+| HDMI-Satz auf −12 dB | −0,6 dB (Schwankung des Programms) |
+| TV-Satz auf −12 dB | −14,8 dB |
+
+Nach Radio-Taste → Exit bleibt der TV-Satz geladen. Das Laden des HDMI-Satzes hängt an derselben
+Erkennung „HDMI-Eingang spielt“ wie das Abschalten der Werbe-Bremse (v1.3.1 gemessen); mit Ton vom
+HDMI-Eingang wurde es nicht gemessen, weil der Apple TV während des Tests schlief.
+
 ## Was nicht gemessen wurde
 
 Der Abgriff hinter dem EQ ist derselbe Connector, an dem auch der HDMI-Mixer hängt. Das analoge

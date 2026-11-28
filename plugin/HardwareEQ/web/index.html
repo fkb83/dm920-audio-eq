@@ -86,6 +86,10 @@ input[type=range]::-moz-range-thumb{width:28px;height:28px;border-radius:50%;bac
     <div><div class="title">Equalizer</div><div class="sub" id="eqsub">–</div></div>
     <label class="switch"><input type="checkbox" id="enabled"><span></span></label>
   </div>
+  <div class="seg" id="profile" style="margin-top:12px">
+    <button data-v="tv">EQ fürs Fernsehen</button>
+    <button data-v="hdmi">EQ für HDMI-Eingang</button>
+  </div>
   <div id="eqbody">
     <canvas id="curve" width="1000" height="300"></canvas>
     <div class="chips" id="presets"></div>
@@ -98,7 +102,7 @@ input[type=range]::-moz-range-thumb{width:28px;height:28px;border-radius:50%;bac
 </section>
 
 <section class="card">
-  <div class="title">Pegel</div>
+  <div class="title">Pegel <span class="sub" id="levelsub"></span></div>
   <div class="band" style="margin-top:6px">
     <label>Gesamt</label>
     <input type="range" id="level" min="-12" max="0" step="1">
@@ -137,6 +141,9 @@ const API = "api";
 const $ = (id) => document.getElementById(id);
 let S = null;                 // last state from the box
 let busyUntil = 0;            // don't overwrite controls while the user is interacting
+let PK = null;                // EQ profile shown: null = follow the source that plays
+const curKey = () => PK || (S && S.source) || "tv";
+const P = () => S.profiles[curKey()];
 let sendTimer = null, pending = {};
 
 function toast(msg) {
@@ -155,7 +162,7 @@ async function call(path, body) {
 
 // ---- sending: live updates are throttled, the final value is saved ----
 function send(obj, save) {
-  Object.assign(pending, obj);
+  Object.assign(pending, obj, {profile: curKey()});
   busyUntil = Date.now() + 2500;
   if (save) { flush(true); return; }
   if (!sendTimer) sendTimer = setTimeout(() => flush(false), 120);
@@ -255,19 +262,25 @@ function render(force) {
   if (!built) build();
   const live = force || Date.now() > busyUntil;
   if (live) {
-    $("enabled").checked = S.enabled; $("protect").checked = S.protect; $("radio_hdmi").checked = S.radio_hdmi;
-    $("level").value = S.level; $("levelv").textContent = S.level + " dB"; paintTrack($("level"));
+    const p = P();
+    $("enabled").checked = p.enabled; $("protect").checked = p.protect; $("radio_hdmi").checked = S.radio_hdmi;
+    $("level").value = p.level; $("levelv").textContent = p.level + " dB"; paintTrack($("level"));
     document.querySelectorAll("#bands input").forEach((inp, i) => {
-      inp.value = S.bands[i]; inp.nextElementSibling.textContent = fmt(S.bands[i]); paintTrack(inp);
+      inp.value = p.bands[i]; inp.nextElementSibling.textContent = fmt(p.bands[i]); paintTrack(inp);
     });
-    markPreset(S.preset); setSeg("agc", S.agc); drawCurve();
+    markPreset(p.preset); setSeg("agc", S.agc); drawCurve();
   }
   setSeg("source", S.source);
+  setSeg("profile", curKey());
+  $("profile").style.display = S.hdmi_available ? "" : "none";
+  $("levelsub").textContent = S.hdmi_available ? "· " + P().name : "";
   $("srcCard").style.display = S.hdmi_available ? "" : "none";
   $("radioCard").style.display = S.hdmi_available ? "" : "none";
-  $("eqbody").classList.toggle("dim", !S.enabled);
-  $("eqsub").textContent = !S.module ? "Treibermodul nicht geladen" :
-    !S.enabled ? "aus" : S.outputs.length ? "aktiv auf " + S.outputs.join(", ") : "kein PCM-Ausgang (Passthrough?)";
+  const pe = P().enabled, here = curKey() === S.active_profile;
+  $("eqbody").classList.toggle("dim", !pe);
+  $("eqsub").textContent = !S.module ? "Treibermodul nicht geladen" : !pe ? "aus für " + P().name :
+    !S.outputs.length ? "kein PCM-Ausgang (Passthrough?)" :
+    here ? "aktiv auf " + S.outputs.join(", ") : "gilt, sobald " + (curKey() === "hdmi" ? "der HDMI-Eingang" : "das Fernsehen") + " läuft";
   const a = S.agc_live, on = S.agc > 0;
   $("agclive").classList.toggle("dim", !on);
   $("agcbar").style.width = on && !a.hdmi ? Math.min(100, -a.gain / 15 * 100) + "%" : "0";
@@ -288,7 +301,14 @@ $("level").oninput = (e) => { $("levelv").textContent = e.target.value + " dB"; 
 $("level").onchange = (e) => send({level: +e.target.value}, true);
 $("flat").onclick = () => { markPreset("flat"); send({preset: "flat"}, true); };
 document.querySelectorAll("#agc button").forEach((b) => b.onclick = () => { setSeg("agc", b.dataset.v); send({agc: +b.dataset.v}, true); });
+document.querySelectorAll("#profile button").forEach((b) => b.onclick = () => {
+  if (sendTimer) flush(false);
+  PK = b.dataset.v === (S && S.source) ? null : b.dataset.v;   // choosing the playing source = follow it again
+  busyUntil = 0; render(true);
+});
 document.querySelectorAll("#source button").forEach((b) => b.onclick = async () => {
+  if (sendTimer) flush(false);
+  PK = null;
   setSeg("source", b.dataset.v);
   try { S = await call(API + "/source", {source: b.dataset.v}); render(true); setOnline(true); toast(b.dataset.v === "hdmi" ? "HDMI-Eingang" : "Fernsehen"); }
   catch (e) { toast(e.message); poll(); }

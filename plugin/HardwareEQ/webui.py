@@ -14,6 +14,17 @@ WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 _registered = False
 
 
+def _profile_state(p):
+	return {
+		"name": p.name,
+		"enabled": p.enabled.value,
+		"preset": p.preset.value,
+		"level": int(p.level.value),
+		"protect": p.protect.value,
+		"bands": p.gains(),
+	}
+
+
 def _state(session):
 	cfg = config.plugins.hardwareeq
 	agc = eq.read_agc()
@@ -28,13 +39,10 @@ def _state(session):
 		if line.startswith("hdmi-in") and line.endswith("EQ"):
 			hdmi_in_eq = True
 	return {
-		"enabled": cfg.enabled.value,
-		"preset": cfg.preset.value,
-		"level": int(cfg.level.value),
-		"protect": cfg.protect.value,
+		"profiles": dict((p.key, _profile_state(p)) for p in eq.PROFILES),
+		"active_profile": eq.active_profile() if eq.module_loaded() else "tv",
 		"agc": int(cfg.agc.value),
 		"radio_hdmi": cfg.radio_hdmi.value,
-		"bands": eq.current_gains(),
 		"band_labels": eqmath.BAND_LABELS,
 		"band_defs": [[k, f, q] for k, f, q in eqmath.BANDS],
 		"presets": [[k, n, g] for k, n, g in eqmath.PRESETS],
@@ -56,23 +64,20 @@ def _state(session):
 
 def _apply(data):
 	cfg = config.plugins.hardwareeq
+	p = eq.PROFILE.get(str(data.get("profile", "tv")), eq.PROFILE["tv"])
 	if "preset" in data:
-		eq.set_preset(str(data["preset"]))
+		p.set_preset(str(data["preset"]))
 	if "bands" in data:
-		gains = [max(eqmath.GAIN_MIN, min(eqmath.GAIN_MAX, int(round(float(g))))) for g in data["bands"]][:len(eq.BANDS_CFG)]
-		for b, g in zip(eq.BANDS_CFG, gains):
+		gains = [max(eqmath.GAIN_MIN, min(eqmath.GAIN_MAX, int(round(float(g))))) for g in data["bands"]][:len(p.bands)]
+		for b, g in zip(p.bands, gains):
 			b.value = str(g)
-		cfg.preset.value = "custom"
-		for k, n, g in eqmath.PRESETS:          # show the preset name again if the curve matches one
-			if g is not None and list(g) == eq.current_gains():
-				cfg.preset.value = k
-				break
+		p.match_preset()
 	if "level" in data:
-		cfg.level.value = str(max(-12, min(0, int(data["level"]))))
+		p.level.value = str(max(-12, min(0, int(data["level"]))))
 	if "enabled" in data:
-		cfg.enabled.value = bool(data["enabled"])
+		p.enabled.value = bool(data["enabled"])
 	if "protect" in data:
-		cfg.protect.value = bool(data["protect"])
+		p.protect.value = bool(data["protect"])
 	if "agc" in data:
 		cfg.agc.value = str(max(0, min(3, int(data["agc"]))))
 	if "radio_hdmi" in data:

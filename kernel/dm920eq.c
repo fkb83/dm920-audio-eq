@@ -199,10 +199,33 @@ static ssize_t gain_read(struct file *file, char __user *buf, size_t cnt, loff_t
 	char tmp[16]; int l = snprintf(tmp, sizeof(tmp), "%d\n", gain_permille);
 	return simple_read_from_buffer(buf, cnt, pos, tmp, l);
 }
-/* write: "N c0 c1 ... c(5N-1)"  (b0 b1 b2 a1 a2 per biquad, Q5.26 integers) */
+/* Two filter sets: 0 = TV, 1 = HDMI input. The worker loads the one that matches what plays.
+ * An HDMI set that was never written falls back to the TV set. */
+struct bqset { int n, valid; s32 c[40]; };
+static struct bqset sets[2];
+static int eq_src;                     /* set currently in the hardware */
+
+static int load_set_locked(int src)    /* caller holds cfg_lock */
+{
+	struct bqset *b = sets[src].valid ? &sets[src] : &sets[0];
+	int i, ret;
+	if (!b->valid) { eq_src = src; return 0; }
+	*(u32 *)(stage_settings + 0x10) = b->n;
+	memset(stage_settings + 0x14, 0, 8 * 20);
+	for (i = 0; i < 8; i++) *(s32 *)(stage_settings + 0x14 + i * 20) = 1 << 26;
+	memcpy(stage_settings + 0x14, b->c, 5 * b->n * 4);
+	bape_lock();
+	ret = F.st_setsettings(stage, stage_settings);
+	bape_unlock();
+	eq_src = src;
+	return ret;
+}
+
+/* write: "N c0 c1 ... c(5N-1)"  (b0 b1 b2 a1 a2 per biquad, Q5.26 integers)
+ * /proc/dm920eq/biquads = TV set, /proc/dm920eq/biquads_hdmi = HDMI-input set */
 static ssize_t bq_write(struct file *file, const char __user *buf, size_t cnt, loff_t *pos)
 {
-	char *tmp, *cur, *tok; int n, i, ret; s32 c[40];
+	char *tmp, *cur, *tok; int n, i, ret = 0, src = PDE_DATA(file_inode(file)) ? 1 : 0; s32 c[40];
 	if (cnt > 1024) return -EINVAL;
 	tmp = kmalloc(cnt + 1, GFP_KERNEL); if (!tmp) return -ENOMEM;
 	if (copy_from_user(tmp, buf, cnt)) { kfree(tmp); return -EFAULT; }
@@ -215,15 +238,11 @@ static ssize_t bq_write(struct file *file, const char __user *buf, size_t cnt, l
 	}
 	kfree(tmp);
 	mutex_lock(&cfg_lock);
-	*(u32 *)(stage_settings + 0x10) = n;
-	memset(stage_settings + 0x14, 0, 8 * 20);
-	for (i = 0; i < 8; i++) *(s32 *)(stage_settings + 0x14 + i * 20) = 1 << 26;
-	memcpy(stage_settings + 0x14, c, 5 * n * 4);
-	bape_lock();
-	ret = F.st_setsettings(stage, stage_settings);
-	bape_unlock();
+	sets[src].n = n; memcpy(sets[src].c, c, 5 * n * 4); sets[src].valid = 1;
+	if (src == eq_src || (src == 0 && eq_src == 1 && !sets[1].valid))
+		ret = load_set_locked(eq_src);
 	mutex_unlock(&cfg_lock);
-	pr_info("dm920eq: set %d biquads ret=%d\n", n, ret);
+	pr_info("dm920eq: set %d biquads (%s) ret=%d\n", n, src ? "hdmi" : "tv", ret);
 	return ret ? -EIO : cnt;
 }
 static const struct file_operations bq_fops = { .owner = THIS_MODULE, .write = bq_write, .llseek = default_llseek };
@@ -238,6 +257,7 @@ static ssize_t status_read(struct file *file, char __user *buf, size_t cnt, loff
 	}
 	l += snprintf(tmp + l, sizeof(tmp) - l, "routing   %s\n", *(void **)(dev + 0xfc) == eqconn ? "driver-stereo=EQ" : "driver-stereo=raw");
 	l += snprintf(tmp + l, sizeof(tmp) - l, "hdmi-in   %s\n", hdmi_linked ? "EQ" : "not linked");
+	l += snprintf(tmp + l, sizeof(tmp) - l, "eq-set    %s\n", eq_src ? (sets[1].valid ? "hdmi" : "hdmi (=tv)") : "tv");
 	return simple_read_from_buffer(buf, cnt, pos, tmp, l);
 }
 static void agc_force_reapply(void);
@@ -548,6 +568,8 @@ static int agc_thread(void *unused)
 		if (running && !A.was_running) agc_reset_reference();   /* zap / restart */
 		A.was_running = running;
 		A.hdmi = hdmi;
+		/* filter set follows the source; while both decoders are stopped keep the current one */
+		if ((hdmi ? 1 : running ? 0 : eq_src) != eq_src) load_set_locked(hdmi ? 1 : 0);
 		if (hdmi) {                 /* the tap now carries the HDMI input: ignore it, no attenuation */
 			n = 0;
 			A.gain = 0; agc_apply_gain(0);
@@ -766,7 +788,8 @@ static int __init eq_init(void)
 	pdir = proc_mkdir("dm920eq", NULL);
 	if (pdir) {
 		proc_create("gain", 0644, pdir, &gain_fops);
-		proc_create("biquads", 0200, pdir, &bq_fops);
+		proc_create_data("biquads", 0200, pdir, &bq_fops, NULL);
+		proc_create_data("biquads_hdmi", 0200, pdir, &bq_fops, (void *)1);
 		proc_create("status", 0644, pdir, &status_fops);
 		proc_create("agc", 0644, pdir, &agc_fops);
 		if (taps) proc_create("capture", 0444, pdir, &cap_fops);
@@ -793,6 +816,7 @@ static void __exit eq_exit(void)
 		remove_proc_entry("conn", pdir);
 		if (maicap) remove_proc_entry("level", pdir);
 		remove_proc_entry("gain", pdir); remove_proc_entry("biquads", pdir);
+		remove_proc_entry("biquads_hdmi", pdir);
 		remove_proc_entry("status", pdir); remove_proc_entry("agc", pdir);
 		remove_proc_entry("dm920eq", NULL);
 	}

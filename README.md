@@ -30,6 +30,8 @@ live vom Handy aus.
   ab, hebt nie an. Live-Anzeige der aktuellen Absenkung im Plugin
 - **HDMI-Eingang:** Ton von einem angeschlossenen Gerät (z. B. Apple TV) läuft ebenfalls durch den EQ
   (nicht durch die Werbe-Bremse, die gilt nur fürs Fernsehen)
+- **Zwei EQ-Profile:** eins fürs Fernsehen, eins für den HDMI-Eingang. Das Modul lädt beim Umschalten
+  automatisch das passende – egal ob per Radio-Taste, Menü oder Web-Seite
 - **Web-Seite fürs Handy** unter `http://<IP-der-Box>/eq` – EQ live einstellen, Quelle umschalten,
   Werbe-Bremse beobachten. Lässt sich auf dem iPhone als App-Symbol auf den Home-Bildschirm legen
 - **Radio-Taste → HDMI-Eingang** (abschaltbar): ein Tastendruck statt Blau – 6 – Gelb; zurück mit Exit
@@ -90,7 +92,8 @@ Im Browser `http://<IP-der-Box>/eq` öffnen (iPhone: *Teilen → Zum Home-Bildsc
 <p align="center"><img src="docs/images/web-ui-1.jpg" width="270" alt="Web-Seite: Equalizer"> &nbsp;
 <img src="docs/images/web-ui-2.jpg" width="270" alt="Web-Seite: Pegel, Werbe-Bremse, Radio-Taste"></p>
 
-Regler ziehen ist sofort hörbar; beim Loslassen wird gespeichert. Oben lässt sich zwischen Fernsehen
+Regler ziehen ist sofort hörbar; beim Loslassen wird gespeichert. Mit „EQ fürs Fernsehen / EQ für
+HDMI-Eingang“ wählt man das Profil; die Seite folgt von sich aus der Quelle, die gerade läuft. Oben lässt sich zwischen Fernsehen
 und HDMI-Eingang umschalten. Die Seite läuft in der Weboberfläche der Box (gleicher Port 80, kein
 Passwortschutz – wie die übrige Weboberfläche nur fürs Heimnetz gedacht).
 
@@ -166,6 +169,9 @@ nachher:  Decoder ──stereo──▶ Zwischen-Mixer ──▶ BAPE-Equalizer 
 Entladen (`rmmod dm920eq`) stellt den Originalzustand wieder her.
 
 ## Versionen
+
+- **1.4.0** – Getrennte EQ-Profile für Fernsehen und HDMI-Eingang (Plugin: „Equalizer einstellen für“,
+  Web-Seite: Profil-Umschalter). Beim ersten Start übernimmt das HDMI-Profil die TV-Einstellung.
 
 - **1.3.1** – Die Werbe-Bremse wirkt nur noch aufs Fernsehen, der HDMI-Eingang läuft nur durch den EQ.
 
