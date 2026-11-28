@@ -28,8 +28,8 @@ live vom Handy aus.
 - **Werbe-Bremse** (Lautstärke-Automatik, *leicht / mittel / stark*): misst laufend die Lautheit und senkt
   ab, wenn es deutlich lauter wird als das laufende Programm – z. B. bei Werbung oder Trailern. Sie senkt nur
   ab, hebt nie an. Live-Anzeige der aktuellen Absenkung im Plugin
-- **HDMI-Eingang:** Ton von einem angeschlossenen Gerät (z. B. Apple TV) läuft ebenfalls durch EQ und
-  Werbe-Bremse
+- **HDMI-Eingang:** Ton von einem angeschlossenen Gerät (z. B. Apple TV) läuft ebenfalls durch den EQ
+  (nicht durch die Werbe-Bremse, die gilt nur fürs Fernsehen)
 - **Web-Seite fürs Handy** unter `http://<IP-der-Box>/eq` – EQ live einstellen, Quelle umschalten,
   Werbe-Bremse beobachten. Lässt sich auf dem iPhone als App-Symbol auf den Home-Bildschirm legen
 - **Radio-Taste → HDMI-Eingang** (abschaltbar): ein Tastendruck statt Blau – 6 – Gelb; zurück mit Exit
@@ -156,7 +156,8 @@ nachher:  Decoder ──stereo──▶ Zwischen-Mixer ──▶ BAPE-Equalizer 
 5. Für die Werbe-Bremse hängt ein Abgriff (`BAPE_OutputCapture`) am DAC-Mixer des Treibers. Ein
    Kernel-Thread misst die Lautheit nach ITU-R BS.1770, rechnet die eigene Absenkung heraus und regelt
    die Eingangslautstärke des Zwischen-Mixers; die Mixer-Hardware blendet weich über.
-6. Der HDMI-Eingang (zweiter Decoder des Treibers) speist ebenfalls den Zwischen-Mixer.
+6. Der HDMI-Eingang (zweiter Decoder des Treibers) speist ebenfalls den Zwischen-Mixer; die
+   Werbe-Bremse regelt nur den TV-Eingang und ruht, solange der HDMI-Eingang läuft.
 7. Der Equalizer-Baustein verarbeitet nur für die Ausgänge, die beim Anschließen seines Eingangs schon
    da waren. Hängt der Treiber Ausgänge neu an (DD+-Passthrough zurück, HDMI-Eingang), hält der Thread
    kurz die Decoder an, hängt alle Ausgänge an den EQ und schließt ihn neu an.
@@ -165,6 +166,8 @@ nachher:  Decoder ──stereo──▶ Zwischen-Mixer ──▶ BAPE-Equalizer 
 Entladen (`rmmod dm920eq`) stellt den Originalzustand wieder her.
 
 ## Versionen
+
+- **1.3.1** – Die Werbe-Bremse wirkt nur noch aufs Fernsehen, der HDMI-Eingang läuft nur durch den EQ.
 
 - **1.3.0** – HDMI-Eingang: Der EQ wirkte nach einem Ausflug auf den HDMI-Eingang am HDMI-Ausgang nicht
   mehr (gemessen: 0 dB statt −12 dB). Behoben; außerdem läuft der Ton des HDMI-Eingangs jetzt selbst

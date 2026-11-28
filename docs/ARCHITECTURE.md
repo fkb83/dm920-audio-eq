@@ -212,8 +212,9 @@ Der Treiber spielt den HDMI-Eingang auf seinem Decoder 1. Relevante Stellen (rel
 Das Modul hängt diesen Connector zusätzlich an den Zwischen-Mixer (nur bei gestopptem Decoder; läuft der
 HDMI-Eingang gerade, holt `rebuild()` das nach). Den Connector-Eintrag des Treibers lässt es
 unverändert: Ein umgebogener Eintrag führte dazu, dass der Treiber beim Start des HDMI-Eingangs gar nicht
-mehr verdrahtete und die Ausgänge nicht startete. Die Werbe-Bremse regelt beide Eingänge des
-Zwischen-Mixers gleich.
+mehr verdrahtete und die Ausgänge nicht startete. Die Werbe-Bremse regelt nur den TV-Eingang des
+Zwischen-Mixers. Solange der HDMI-Eingang spielt (und der TV-Decoder steht), ignoriert sie den Abgriff und
+steht auf 0 dB; `/proc/dm920eq/agc` meldet dann `hdmi_input 1`.
 
 Gestartet und beendet wird der HDMI-Eingang vom New-Nigma-Plugin (`Plugins/newnigma2/hdmi`, Funktion
 `HDMID(session)` öffnet die Wiedergabe direkt, `HdmiMain.leave()` beendet sie). Das EQ-Plugin ruft genau

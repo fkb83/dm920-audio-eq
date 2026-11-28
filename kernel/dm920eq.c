@@ -66,7 +66,6 @@ module_param(hdmiin, int, 0444);
 #define HDMI_MTX_OFF  0x400
 #define BDEC_STATE    0x3e4             /* BAPE decoder state, 0 = stopped */
 static void *hstereo; static int hdmi_linked; static struct mutex *dec1_mutex;
-static u8 hvol_base[264]; static int hvol_base_ok;
 static void *tapmix[2], *tapcap[2], *tapport[2];
 static int ports_done[5];
 static DEFINE_MUTEX(cfg_lock);
@@ -264,7 +263,6 @@ static void link_hdmi(int checked)
 		F.mix_getdef(ms); ms[0] = 1;
 		if (!F.mix_add(pre, hstereo, ms)) {
 			hdmi_linked = 1;
-			hvol_base_ok = F.mix_getvol(pre, hstereo, hvol_base) == 0;
 		}
 	}
 	pr_info("dm920eq: hdmi input %s\n", hdmi_linked ? "through EQ" : busy ? "busy, linked later" : "not linked");
@@ -362,6 +360,7 @@ static struct {
 	int silent_blocks, was_running, applied_idx, want_idx;
 	int meas;                /* last block as measured at the tap, before compensation (mdB) */
 	int nodata;              /* worker loops without captured audio */
+	int hdmi;                /* HDMI input plays: ad brake idle */
 	u32 loops, empty, bytes, blocks, maxchunk, dbg_d0, dbg_d4, dbg_wrap;
 } A = { .applied_idx = -1 };
 static void agc_force_reapply(void) { A.applied_idx = -1; }
@@ -401,15 +400,8 @@ static void agc_set_volume_locked(int idx)
 		u32 c = ((u32 *)vol_base)[i];
 		if (c) ((u32 *)v)[i] = (u32)(((u64)c * g) >> 16);
 	}
+	/* only the TV input: the HDMI input goes through the EQ, but never through the ad brake */
 	if (!F.mix_setvol(pre, stereo, v)) A.applied_idx = idx;
-	if (hdmi_linked && hvol_base_ok) {
-		memcpy(v, hvol_base, VOLSZ);
-		for (i = 0; i < 64; i++) {
-			u32 c = ((u32 *)hvol_base)[i];
-			if (c) ((u32 *)v)[i] = (u32)(((u64)c * g) >> 16);
-		}
-		F.mix_setvol(pre, hstereo, v);
-	}
 }
 
 static void agc_reset_reference(void)
@@ -519,12 +511,13 @@ static int agc_thread(void *unused)
 	mutex_lock(dec_mutex); eq_was_on = eq_routed(); mutex_unlock(dec_mutex);
 
 	while (!kthread_should_stop()) {
-		u8 d[96]; u32 n = 0; int running, eq_on;
+		u8 d[96]; u32 n = 0; int running, eq_on, hdmi;
 
 		/* everything that touches driver objects happens under the driver's own locks, so a DSP
 		 * watchdog recovery or a decoder restart can never tear the capture down underneath us */
 		bape_lock();
 		running = *(volatile u32 *)(dec + 0xf4);
+		hdmi = hdmi_running() && !running;
 		eq_on = eq_routed();
 		if (agccap && !F.cap_getbuffer(agccap, d)) {
 			const s32 *p = *(const s32 **)(d + 8);
@@ -554,6 +547,11 @@ static int agc_thread(void *unused)
 		A.loops++;
 		if (running && !A.was_running) agc_reset_reference();   /* zap / restart */
 		A.was_running = running;
+		A.hdmi = hdmi;
+		if (hdmi) {                 /* the tap now carries the HDMI input: ignore it, no attenuation */
+			n = 0;
+			A.gain = 0; agc_apply_gain(0);
+		}
 		if (n) { agc_process(agc_buf, n / 8); A.nodata = 0; }
 		else {
 			A.empty++;
@@ -594,9 +592,9 @@ static ssize_t agc_write(struct file *file, const char __user *buf, size_t cnt, 
 static ssize_t agc_read(struct file *file, char __user *buf, size_t cnt, loff_t *pos)
 {
 	char tmp[400];
-	int l = snprintf(tmp, sizeof(tmp), "mode %d\nloudness %d\nreference %d\ngain %d\nreference_valid %d\nactive %d\nmeasured %d\napplied %d\n"
+	int l = snprintf(tmp, sizeof(tmp), "mode %d\nloudness %d\nreference %d\ngain %d\nreference_valid %d\nactive %d\nmeasured %d\napplied %d\nhdmi_input %d\n"
 		"debug loops=%u empty=%u bytes=%u blocks=%u maxchunk=%u il=%u nbuf=%u wrap=%u rebuilds=%u/%u\n",
-		A.mode, A.loud, A.ref, A.gain, A.ref_valid, agccap != NULL, A.meas, -100 * A.applied_idx,
+		A.mode, A.loud, A.ref, A.gain, A.ref_valid, agccap != NULL, A.meas, -100 * A.applied_idx, A.hdmi,
 		A.loops, A.empty, A.bytes, A.blocks, A.maxchunk, A.dbg_d0, A.dbg_d4, A.dbg_wrap, rebuilds, rebuild_errors);
 	return simple_read_from_buffer(buf, cnt, pos, tmp, l);
 }
@@ -624,7 +622,6 @@ static void teardown_agc(void)
 	if (agccap) { F.mix_rmout(agcmix, agcport); F.cap_close(agccap); agccap = NULL; }
 	agcmix = NULL;
 	if (vol_base_ok) F.mix_setvol(pre, stereo, vol_base);
-	if (hdmi_linked && hvol_base_ok) F.mix_setvol(pre, hstereo, hvol_base);
 }
 
 /* ---- diagnostics: connector dump and a level tap on the HDMI (MAI) mixer (module param maitap=1) ---- */

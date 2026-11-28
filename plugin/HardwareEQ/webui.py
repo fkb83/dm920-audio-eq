@@ -49,6 +49,7 @@ def _state(session):
 			"reference": agc.get("reference", 0) / 1000.0,
 			"gain": agc.get("gain", 0) / 1000.0,
 			"valid": bool(agc.get("reference_valid", 0)),
+			"hdmi": bool(agc.get("hdmi_input", 0)),
 		},
 	}
 

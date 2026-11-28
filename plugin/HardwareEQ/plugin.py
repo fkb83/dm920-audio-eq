@@ -308,13 +308,15 @@ class HardwareEQSetup(ConfigListScreen, Screen):
 		txt = self.eq_info
 		if config.plugins.hardwareeq.agc.value != "0":
 			a = read_agc()
-			if not a.get("reference_valid"):
+			if a.get("hdmi_input"):
+				txt += "\nWerbe-Bremse: beim HDMI-Eingang aus (nur EQ)"
+			elif not a.get("reference_valid"):
 				txt += "\nWerbe-Bremse: lernt den Pegel des Programms ..."
 			elif a.get("gain", 0) <= -500:
 				txt += "\nWerbe-Bremse: senkt gerade um %.1f dB ab" % (-a["gain"] / 1000.0)
 			else:
 				txt += "\nWerbe-Bremse: bereit (keine Absenkung)"
-			if "loudness" in a and "reference" in a and a.get("reference_valid"):
+			if "loudness" in a and "reference" in a and a.get("reference_valid") and not a.get("hdmi_input"):
 				txt += "  [Lautheit %.0f, Bezug %.0f LUFS]" % (a["loudness"] / 1000.0, a["reference"] / 1000.0)
 		self["info"].setText(txt)
 

@@ -270,10 +270,10 @@ function render(force) {
     !S.enabled ? "aus" : S.outputs.length ? "aktiv auf " + S.outputs.join(", ") : "kein PCM-Ausgang (Passthrough?)";
   const a = S.agc_live, on = S.agc > 0;
   $("agclive").classList.toggle("dim", !on);
-  $("agcbar").style.width = on ? Math.min(100, -a.gain / 15 * 100) + "%" : "0";
-  $("agctxt").textContent = !on ? "aus" : !a.valid ? "lernt den Programmpegel …" :
+  $("agcbar").style.width = on && !a.hdmi ? Math.min(100, -a.gain / 15 * 100) + "%" : "0";
+  $("agctxt").textContent = !on ? "aus" : a.hdmi ? "beim HDMI-Eingang aus (nur EQ)" : !a.valid ? "lernt den Programmpegel …" :
     a.gain <= -0.5 ? `senkt ab: ${a.gain.toFixed(1)} dB` : "bereit, keine Absenkung";
-  $("agcvals").textContent = on && a.valid ? `Lautheit ${a.loudness.toFixed(0)} · Bezug ${a.reference.toFixed(0)} LUFS` : "";
+  $("agcvals").textContent = on && a.valid && !a.hdmi ? `Lautheit ${a.loudness.toFixed(0)} · Bezug ${a.reference.toFixed(0)} LUFS` : "";
 }
 function setOnline(ok, msg) {
   const p = $("status");
